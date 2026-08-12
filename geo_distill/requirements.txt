@@ -1,0 +1,12 @@
+# Core: JAX + Flax + optax
+jax[cpu]>=0.4        # for GPU/TPU install the matching jax wheel instead (see README)
+flax>=0.12          # the model uses the Flax NNX API
+optax>=0.2
+numpy
+
+# Tokenizer + data
+tokenizers>=0.15
+datasets>=2.14      # only needed by data.py
+
+# Teacher endpoint client
+google-genai>=1.0   # only needed by embed_teacher.py (Gemini embeddings)

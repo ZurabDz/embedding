@@ -13,3 +13,4 @@ wheels/
 .dotenv
 .env
 .env.*
+lm/checkpoints/*

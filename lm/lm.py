@@ -13,22 +13,35 @@ Real run on Georgian FineWeb-2:
     pip install datasets tokenizers
     python lm.py --steps 20000 --docs 200000
 
+Corpora too large to hold in host RAM are tokenised once, up front, and then
+streamed off disk — which also keeps a GPU session from spending its time on
+CPU work:
+    python lm.py --tokenize-to data/ka --docs 2000000
+    python lm.py --data-dir data/ka --steps 100000
+
 On TPU or a multi-GPU host the batch is sharded over every local device and
 compute can drop to bf16 while the weights stay fp32:
     python lm.py --steps 20000 --docs 200000 --batch-size 128 --dtype bfloat16
 
-Interrupted runs continue with their Adam moments intact:
+Add --remat to trade ~4% more compute for a large cut in activation memory when
+the batch you want will not otherwise fit.
+
+Interrupted runs continue with their Adam moments *and* their exact position in
+the data stream, so a resumed run matches an uninterrupted one:
     python lm.py --steps 20000 --resume
 """
 
 import argparse
 import dataclasses
+import functools
 import json
 import math
 import os
 import time
 from typing import Iterable, Iterator
 
+import grain
+import grain.experimental
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -70,6 +83,9 @@ class EncoderConfig:
     # would put Adam's moments in bf16 along with the parameters.
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
+    # Recompute every block's activations in the backward pass. Off by default;
+    # this is what you reach for when you want a batch the card will not hold.
+    remat: bool = False
 
     @property
     def head_dim(self) -> int:
@@ -124,6 +140,26 @@ def attention_bias(attention_mask, dtype):
 # ----------------------------------------------------------------------------
 
 
+@functools.partial(jax.checkpoint, policy=jax.checkpoint_policies.nothing_saveable)
+def _attend(q, k, v, bias, scale):
+    """Scores -> softmax -> values, rematerialised in the backward pass.
+
+    The [B,H,L,L] score matrix is the single largest activation in the model —
+    192 MiB per layer at batch 32, and one copy survives per layer as the
+    softmax's residual, so 2.25 GiB across 12 layers. Recomputing it costs about
+    4% more FLOPs and is the best memory-per-FLOP trade available here.
+
+    Deliberately not jax.nn.dot_product_attention: its 'xla' path performs this
+    exact sequence and materialises exactly as much, and its fused 'cudnn' path
+    rejects float32 outright and needs Ampere, so it is unavailable on the T4
+    this has to run on.
+    """
+    scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
+    # softmax in fp32 regardless of compute dtype
+    w = jax.nn.softmax((scores + bias).astype(jnp.float32), axis=-1).astype(v.dtype)
+    return jnp.einsum("bhqk,bhkd->bhqd", w, v)
+
+
 class BidirectionalAttention(nnx.Module):
     def __init__(self, cfg: EncoderConfig, *, out_std: float, rngs: nnx.Rngs):
         self.cfg = cfg
@@ -150,13 +186,17 @@ class BidirectionalAttention(nnx.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
-        scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) / math.sqrt(d)
-        scores = scores + bias
-        # softmax in fp32 regardless of compute dtype
-        weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(x.dtype)
-        weights = self.drop(weights)
-
-        out = jnp.einsum("bhqk,bhkd->bhqd", weights, v)
+        if cfg.dropout > 0.0:
+            # Dropout belongs on the attention weights, and the module's RNG
+            # cannot cross into a pure checkpointed function — so when it is on,
+            # take the unrematerialised path rather than quietly moving where the
+            # noise is applied. cfg.dropout is static, so this costs no runtime
+            # branch. ModernBERT trains at 0.0, which is the default here.
+            scores = jnp.einsum("bhqd,bhkd->bhqk", q, k) / math.sqrt(d)
+            weights = jax.nn.softmax((scores + bias).astype(jnp.float32), axis=-1)
+            out = jnp.einsum("bhqk,bhkd->bhqd", self.drop(weights.astype(x.dtype)), v)
+        else:
+            out = _attend(q, k, v, bias, 1.0 / math.sqrt(d))
         out = out.transpose(0, 2, 1, 3).reshape(b, l, cfg.hidden)
         return self.wo(out)
 
@@ -244,6 +284,19 @@ class MLMHead(nnx.Module):
 # ----------------------------------------------------------------------------
 
 
+@functools.partial(nnx.remat,
+                   policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
+def _remat_block(block, x, bias, cos, sin):
+    """One encoder block with its activations recomputed in the backward pass.
+
+    The policy saves the Linear matmuls (no batch dims) and recomputes the
+    attention einsums (which carry b,h batch dims) — the right split, at ~4%
+    more FLOPs. nnx.remat rejects bound methods, so `block` has to arrive as an
+    ordinary first argument rather than as `block.__call__`.
+    """
+    return block(x, bias, cos, sin)
+
+
 class MlmEncoder(nnx.Module):
     def __init__(self, cfg: EncoderConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
@@ -261,6 +314,15 @@ class MlmEncoder(nnx.Module):
         )
         self.head = MLMHead(cfg, rngs=rngs)
 
+    def _run_blocks(self, x, bias, cos, sin):
+        if self.cfg.remat:
+            for block in self.blocks:
+                x = _remat_block(block, x, bias, cos, sin)
+        else:
+            for block in self.blocks:
+                x = block(x, bias, cos, sin)
+        return x
+
     def encode(self, input_ids, attention_mask):
         """Returns hidden states [B, L, hidden] — use this for embeddings."""
         cfg = self.cfg
@@ -269,13 +331,20 @@ class MlmEncoder(nnx.Module):
         bias = attention_bias(attention_mask, cfg.dtype)
 
         x = self.embed_drop(self.tok.encode(input_ids))
-        for block in self.blocks:
-            x = block(x, bias, cos, sin)
+        x = self._run_blocks(x, bias, cos, sin)
         return self.final_norm(x)
 
-    def __call__(self, input_ids, attention_mask):
-        """Returns logits [B, L, vocab_size]."""
+    def __call__(self, input_ids, attention_mask, positions=None):
+        """Logits [B, L, vocab] — or [B, K, vocab] when `positions` is given.
+
+        Gathering the masked positions before the head is the difference between
+        projecting 512 positions into a 32k vocabulary and projecting the ~154
+        that are actually scored. K is a Python int fixed for the run, so the
+        gather is statically shaped and nothing retraces.
+        """
         x = self.encode(input_ids, attention_mask)
+        if positions is not None:
+            x = jnp.take_along_axis(x, positions[:, :, None], axis=1)  # [B, K, hidden]
         return self.tok.decode(self.head(x))
 
 
@@ -284,22 +353,22 @@ class MlmEncoder(nnx.Module):
 # ----------------------------------------------------------------------------
 
 
-def _masked_ce(logits, labels, weights):
-    """Cross-entropy averaged over positions where weights == 1.
+def _masked_ce(logits, targets, weights):
+    """Cross-entropy over the gathered targets, averaged by weight.
 
-    Computed over every position and then masked, rather than gathering the
-    masked positions: gathering gives a batch-dependent shape and forces jax
-    to retrace on every new count.
+    The fp32 cast is load-bearing under --dtype bfloat16: optax's
+    softmax_cross_entropy_with_integer_labels goes through jax.nn.logsumexp,
+    which does not promote, so the sum over 32k vocabulary entries would be
+    accumulated with 8 mantissa bits.
     """
-    safe = jnp.where(labels >= 0, labels, 0)
-    ce = optax.softmax_cross_entropy_with_integer_labels(logits, safe)
+    ce = optax.softmax_cross_entropy_with_integer_labels(
+        logits.astype(jnp.float32), targets)
     return (ce * weights).sum() / jnp.maximum(weights.sum(), 1.0)
 
 
 def mlm_loss(model: MlmEncoder, batch):
-    logits = model(batch["input_ids"], batch["attention_mask"])
-    labels = batch["labels"]
-    return _masked_ce(logits, labels, (labels >= 0).astype(jnp.float32))
+    logits = model(batch["input_ids"], batch["attention_mask"], batch["positions"])
+    return _masked_ce(logits, batch["targets"], batch["weights"])
 
 
 # ----------------------------------------------------------------------------
@@ -474,16 +543,44 @@ def assert_writable(save_dir: str) -> None:
         )
 
 
-def save_checkpoint(mgr, step: int, model: MlmEncoder, optimizer) -> None:
-    """Params *and* optimizer state. The trapezoid plateau is only a free
-    parameter if a fork can resume Adam's moments, not just the weights.
+def save_checkpoint(mgr, step: int, model: MlmEncoder, optimizer,
+                    data_iter=None) -> None:
+    """Params, optimizer state, *and* the input pipeline's position.
+
+    The trapezoid plateau is only a free parameter if a fork can resume Adam's
+    moments, and a resumed run is only equivalent to an uninterrupted one if the
+    data stream picks up where it stopped rather than reseeding into a different
+    permutation.
     """
     import orbax.checkpoint as ocp
 
-    mgr.save(step, args=ocp.args.Composite(
-        model=ocp.args.StandardSave(nnx.state(model, nnx.Param)),
-        opt=ocp.args.StandardSave(nnx.state(optimizer)),
-    ))
+    items = {
+        "model": ocp.args.StandardSave(nnx.state(model, nnx.Param)),
+        "opt": ocp.args.StandardSave(nnx.state(optimizer)),
+    }
+    if data_iter is not None:
+        items["data_iter"] = grain.checkpoint.CheckpointSave(item=data_iter)
+    mgr.save(step, args=ocp.args.Composite(**items))
+
+
+def restore_data_iter(save_dir: str, data_iter, step: int) -> None:
+    """Restore the grain iterator in place, if this checkpoint carries one.
+
+    Checkpoints written before the pipeline moved to grain have no `data_iter`
+    entry; those still resume their weights, they just restart the stream.
+    """
+    import orbax.checkpoint as ocp
+
+    mgr = checkpoint_manager(save_dir)
+    try:
+        mgr.restore(step, args=ocp.args.Composite(
+            data_iter=grain.checkpoint.CheckpointRestore(item=data_iter)))
+        print(f"  data pipeline resumed at its saved position")
+    except (KeyError, FileNotFoundError, ValueError) as e:
+        print(f"  no data_iter in checkpoint {step} ({type(e).__name__}); "
+              f"restarting the stream")
+    finally:
+        mgr.close()
 
 
 def load_checkpoint(save_dir: str, step: int | None = None):
@@ -609,7 +706,7 @@ class ByteTokenizer:
 
 
 def chunk_documents(texts: Iterable[str], tokenizer, seq_len: int, *,
-                    with_doc_ids: bool = False):
+                    with_doc_ids: bool = False, consume: bool = False):
     """One document per chunk boundary — never packs two documents together.
 
     NeoBERT measured cross-document sequence packing at -2.9 GLUE, so each
@@ -617,15 +714,26 @@ def chunk_documents(texts: Iterable[str], tokenizer, seq_len: int, *,
 
     With `with_doc_ids`, also returns the source document index of every window,
     which is what lets the train/val split cut on document boundaries.
+
+    With `consume`, pops each document off `texts` as it is tokenised, so the
+    corpus of Python strings is released during the pass rather than staying
+    live alongside the growing window table.
     """
     body = seq_len - 2  # room for [CLS] and [SEP]
-    chunks: list[np.ndarray] = []
-    doc_ids: list[int] = []
-    for doc, text in enumerate(texts):
+    # Grow a preallocated array instead of stacking a list of rows at the end:
+    # the list of ndarrays is slightly *larger* than the array it becomes, and
+    # np.stack holds both at once.
+    cap, n = 1024, 0
+    rows = np.empty((cap, seq_len), dtype=np.int32)
+    doc_ids = np.empty(cap, dtype=np.int32)
+
+    source = _draining(texts) if consume else enumerate(texts)
+    for doc, text in source:
         if hasattr(tokenizer, "encode_ids"):
             ids = tokenizer.encode_ids(text)
         else:
             ids = tokenizer.encode(text).ids
+        del text
         for start in range(0, len(ids), body):
             window = ids[start:start + body]
             # Only drop windows too short to carry context. The old threshold of
@@ -633,99 +741,241 @@ def chunk_documents(texts: Iterable[str], tokenizer, seq_len: int, *,
             # document outright and roughly a quarter of all document tails.
             if len(window) < MIN_WINDOW_TOKENS:
                 continue
-            row = np.full(seq_len, PAD_ID, dtype=np.int32)
-            row[0] = CLS_ID
-            row[1:1 + len(window)] = window
-            row[1 + len(window)] = SEP_ID
-            chunks.append(row)
-            doc_ids.append(doc)
-    if not chunks:
+            if n == cap:
+                cap *= 2
+                rows = np.resize(rows, (cap, seq_len))
+                doc_ids = np.resize(doc_ids, cap)
+            rows[n, :] = PAD_ID
+            rows[n, 0] = CLS_ID
+            rows[n, 1:1 + len(window)] = window
+            rows[n, 1 + len(window)] = SEP_ID
+            doc_ids[n] = doc
+            n += 1
+    if not n:
         raise RuntimeError("no chunks produced — corpus too small or all filtered")
-    rows = np.stack(chunks)
-    return (rows, np.asarray(doc_ids, dtype=np.int64)) if with_doc_ids else rows
+    rows = rows[:n].copy()
+    return (rows, doc_ids[:n].copy()) if with_doc_ids else rows
 
 
-def mask_batch(rows: np.ndarray, rng: np.random.Generator, mask_prob: float):
-    """Dynamic masking, regenerated per batch (RoBERTa) rather than per corpus.
+def _draining(texts):
+    """enumerate(), but releases each document as it is handed over.
+
+    At --docs 200000 the corpus is a gigabyte or more of Python strings, and it
+    would otherwise stay resident through the whole chunking pass on top of the
+    window table being built.
+    """
+    if not isinstance(texts, list):
+        yield from enumerate(texts)
+        return
+    texts.reverse()  # so popping from the end walks forward through the corpus
+    i = 0
+    while texts:
+        yield i, texts.pop()
+        i += 1
+
+
+def split_by_document(doc_ids, val_frac: float, batch_size: int, seed: int):
+    """Held-out mask over windows, cut on document boundaries.
+
+    Splitting on windows instead would drop two chunks of the same article on
+    opposite sides and the held-out loss would read back part of the training
+    set. Grows the held-out set until it yields a few real eval batches, because
+    a single batch makes the number pure noise.
+    """
+    n_docs = int(doc_ids.max()) + 1
+    order = np.random.default_rng(seed).permutation(n_docs)
+    n_val = max(1, int(round(n_docs * val_frac)))
+    want = batch_size * MIN_VAL_BATCHES
+    while True:
+        is_val = np.isin(doc_ids, order[:n_val])
+        if is_val.sum() >= want or n_val >= max(1, n_docs // 2):
+            return is_val, n_val, n_docs
+        n_val = min(n_val * 2, max(1, n_docs // 2))
+
+
+def write_array_record(rows: np.ndarray, path: str, options: str) -> None:
+    """Windows -> one ArrayRecord file, as raw little-endian int32.
+
+    close() is not optional — the chunk index is written there, and there is no
+    context-manager binding on the pybind writer, hence the try/finally.
+    """
+    from array_record.python import array_record_module
+
+    writer = array_record_module.ArrayRecordWriter(path, options)
+    try:
+        for row in rows:
+            writer.write(row.astype("<i4").tobytes())
+    finally:
+        writer.close()
+
+
+def tokenize_to(args, out_dir: str) -> None:
+    """One-time CPU pass: corpus -> train/val ArrayRecord files + meta.json.
+
+    Decouples tokenisation from training, so a GPU or TPU session never spends
+    its time here, and lifts the cap that holding every window in host RAM puts
+    on corpus size.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    print("building corpus ...", flush=True)
+    texts = list(iter_texts(args.dataset, args.config, args.docs, args.smoke))
+    tokenizer = (ByteTokenizer() if args.smoke
+                 else build_tokenizer(texts, args.vocab_size, args.tokenizer_path))
+    vocab_size = (ByteTokenizer.vocab if args.smoke else tokenizer.get_vocab_size())
+
+    chunks, doc_ids = chunk_documents(texts, tokenizer, args.seq_len,
+                                      with_doc_ids=True, consume=True)
+    del texts
+    is_val, n_val_docs, n_docs = split_by_document(
+        doc_ids, args.val_frac, args.batch_size, args.seed)
+
+    # group_size is the decompression unit, and grain reads every source through
+    # random access even when the consumer is sequential — it warns loudly at
+    # anything above 1. So 1 for both files, val included.
+    for name, rows in (("train", chunks[~is_val]), ("val", chunks[is_val])):
+        write_array_record(rows, os.path.join(out_dir, f"{name}.array_record"),
+                           "group_size:1")
+    n_train, n_v = int((~is_val).sum()), int(is_val.sum())
+    with open(os.path.join(out_dir, "meta.json"), "w") as f:
+        json.dump({"seq_len": args.seq_len, "vocab_size": vocab_size,
+                   "tokenizer": None if args.smoke else args.tokenizer_path,
+                   "n_train": n_train, "n_val": n_v, "n_docs": n_docs,
+                   "val_frac": args.val_frac, "seed": args.seed}, f, indent=2)
+    print(f"wrote {n_train} train / {n_v} val windows of {args.seq_len} tokens "
+          f"({n_val_docs}/{n_docs} documents held out), vocab {vocab_size}")
+    print(f"  -> {os.path.abspath(out_dir)}; train with --data-dir {out_dir}")
+
+
+def read_meta(data_dir: str) -> dict:
+    with open(os.path.join(data_dir, "meta.json")) as f:
+        return json.load(f)
+
+
+def n_predictions(seq_len: int, mask_prob: float) -> int:
+    """Target slots per row — BERT's max_predictions_per_seq.
+
+    Fixed for the run so the gather in MlmEncoder.__call__ is statically shaped.
+    """
+    return max(1, int(round(mask_prob * seq_len)))
+
+
+def mask_batch(rows: np.ndarray, rng: np.random.Generator, mask_prob: float,
+               n_pred: int):
+    """Dynamic masking, regenerated every time (RoBERTa) rather than per corpus.
 
     30% of maskable positions -> [MASK] 100% of the time. No 80/10/10 split.
+
+    Returns the targets *gathered* into [B, n_pred] rather than scattered across
+    [B, seq_len] with -100 padding: only these positions are ever projected into
+    the vocabulary, which is roughly a third of the logits and a quarter of the
+    step. Rows with fewer maskable tokens than n_pred get weight 0 in the tail.
     """
+    rows = np.atleast_2d(rows)
     attention_mask = (rows != PAD_ID).astype(np.int32)
     maskable = attention_mask.astype(bool) & (rows >= N_SPECIAL)
 
-    selected = (rng.random(rows.shape) < mask_prob) & maskable
-    # guarantee at least one target per row, or the loss is undefined for it
-    for i in np.where(~selected.any(axis=1))[0]:
-        candidates = np.flatnonzero(maskable[i])
-        if candidates.size:
-            selected[i, rng.choice(candidates)] = True
+    # rank maskable positions by a random key and take the first n_pred; this
+    # replaces both the per-position bernoulli draw and the per-row loop that
+    # used to guarantee at least one target
+    keys = rng.random(rows.shape)
+    keys[~maskable] = np.inf
+    order = np.argsort(keys, axis=1, kind="stable")[:, :n_pred]
 
-    # `rows` is a fancy-indexed copy of the chunk table and is never mutated
-    labels = np.where(selected, rows, -100).astype(np.int32)
-    input_ids = np.where(selected, MASK_ID, rows).astype(np.int32)
+    n_maskable = maskable.sum(1, keepdims=True)
+    k = np.clip(np.rint(mask_prob * n_maskable), 1, None)
+    k = np.minimum(k, np.minimum(n_maskable, n_pred))
+    keep = np.arange(n_pred)[None, :] < k  # [B, n_pred]
+
+    chosen = np.take_along_axis(rows, order, axis=1)
+    input_ids = rows.copy()  # `rows` may be a view onto the chunk table
+    np.put_along_axis(input_ids, order, np.where(keep, MASK_ID, chosen), axis=1)
     return {
-        "input_ids": input_ids,
+        "input_ids": input_ids.astype(np.int32),
         "attention_mask": attention_mask,
-        "labels": labels,
+        "positions": np.where(keep, order, 0).astype(np.int32),
+        "targets": np.where(keep, chosen, 0).astype(np.int32),
+        "weights": keep.astype(np.float32),
     }
 
 
-def batch_stream(chunks, batch_size, mask_prob, seed=0, sharding=None):
-    rng = np.random.default_rng(seed)
-    n = len(chunks)
-    while True:
-        order = rng.permutation(n)
-        for i in range(0, n - batch_size + 1, batch_size):
-            rows = chunks[order[i:i + batch_size]]
-            yield to_device(mask_batch(rows, rng, mask_prob), sharding)
+class MaskExample(grain.transforms.RandomMap):
+    """Per-example dynamic masking.
 
-
-def prefetch(batches, depth: int = 2):
-    """Run the host-side masking a few batches ahead of the device.
-
-    mask_batch is numpy on the CPU and the transfer that follows it is not free.
-    Without this the accelerator sits idle through both on every single step —
-    invisible on CPU, a real bubble on TPU. The thread is a daemon because
-    batch_stream never terminates.
+    Grain derives this element's RNG from its index by resetting a Philox
+    counter, so the mask a given window receives is a pure function of that
+    index. Two consequences worth having: changing --batch-size no longer
+    changes every mask, and a resumed run reproduces masks exactly rather than
+    relying on the RNG state having been checkpointed.
     """
-    import queue
-    import threading
 
-    q: queue.Queue = queue.Queue(maxsize=depth)
-    done = object()
+    def __init__(self, mask_prob: float, n_pred: int):
+        self.mask_prob = mask_prob
+        self.n_pred = n_pred
 
-    def fill():
-        try:
-            for b in batches:
-                q.put(b)
-        finally:
-            q.put(done)
-
-    threading.Thread(target=fill, daemon=True).start()
-    while True:
-        b = q.get()
-        if b is done:
-            return
-        yield b
+    def random_map(self, row, rng):
+        out = mask_batch(row, rng, self.mask_prob, self.n_pred)
+        return {k: v[0] for k, v in out.items()}  # drop the batch axis
 
 
-def evaluate(model, chunks, batch_size, mask_prob, seed=1234, max_batches=32,
-             sharding=None):
+def decode_record(raw: bytes) -> np.ndarray:
+    """One ArrayRecord payload -> one window.
+
+    The astype is not redundant: np.frombuffer returns a read-only view over
+    immutable bytes, and a writeable copy costs 2 KB here.
+    """
+    return np.frombuffer(raw, dtype="<i4").astype(np.int32)
+
+
+def make_dataset(source, batch_size: int, mask_prob: float, n_pred: int,
+                 seed: int, *, decode: bool = False, repeat: bool = True):
+    """The whole input pipeline.
+
+    `source` is either the in-memory [N, seq_len] chunk table (a 2-D ndarray
+    already satisfies grain's RandomAccessDataSource protocol) or an
+    ArrayRecordDataSource, in which case `decode` turns bytes back into rows.
+
+    Deliberately no mp_prefetch: grain spawns workers and ships the dataset
+    graph through cloudpickle, which would capture the source array itself and
+    give every worker a full resident copy with no copy-on-write. On an
+    in-memory source that is a much larger memory problem than the one this
+    pipeline solves. num_threads=0 for the same reason grain's own docs give —
+    the data is already in RAM, so reader threads only contend on the GIL.
+    """
+    ds = grain.MapDataset.source(source)
+    if decode:
+        ds = ds.map(decode_record)
+    ds = ds.seed(seed).shuffle()
+    if repeat:
+        ds = ds.repeat()
+    return (
+        ds.random_map(MaskExample(mask_prob, n_pred))
+        .batch(batch_size, drop_remainder=True)
+        .to_iter_dataset(grain.ReadOptions(num_threads=0, prefetch_buffer_size=64))
+    )
+
+
+def device_stream(iter_ds, sharding):
+    """Overlap host masking with device compute, and double-buffer on device."""
+    target = sharding if sharding is not None else jax.devices()[0]
+    return grain.experimental.device_put(
+        iter_ds, target, cpu_buffer_size=4, device_buffer_size=2)
+
+
+def evaluate(model, val_ds, max_batches: int = 32):
     """Mean MLM loss over held-out windows.
 
-    The rng is re-seeded on every call so the masking pattern is identical each
-    time: otherwise the number moves with the mask draw and two evals are not
-    comparable. Capped at max_batches so eval cost stays flat as the split grows.
+    No re-seeding needed any more: masks are a pure function of element index,
+    so two evals over the same finite dataset are comparable by construction.
+    Capped at max_batches so eval cost stays flat as the split grows.
     """
-    rng = np.random.default_rng(seed)
-    total, n = 0.0, 0
-    for i in range(0, len(chunks) - batch_size + 1, batch_size):
-        if n >= max_batches:
+    losses = []
+    for batch in val_ds:
+        if len(losses) >= max_batches:
             break
-        rows = chunks[i:i + batch_size]
-        total += float(eval_step(model, to_device(mask_batch(rows, rng, mask_prob), sharding)))
-        n += 1
-    return total / max(n, 1)
+        losses.append(eval_step(model, batch))
+    if not losses:
+        return 0.0
+    return float(sum(losses) / len(losses))  # one sync, not one per batch
 
 
 # ----------------------------------------------------------------------------
@@ -791,8 +1041,9 @@ def selftest():
     # a correctly initialised MLM head starts at ln(vocab_size)
     full = MlmEncoder(EncoderConfig(), rngs=nnx.Rngs(0))
     rows = rng.integers(N_SPECIAL, 32_000, (2, 128)).astype(np.int32)
+    n_pred = n_predictions(128, 0.30)
     batch = {k: jnp.asarray(v)
-             for k, v in mask_batch(rows, rng, 0.30).items()}
+             for k, v in mask_batch(rows, rng, 0.30, n_pred).items()}
     loss = float(mlm_loss(full, batch))
     # Bounded loosely on purpose. The expected value is ln(vocab) + sigma^2 / 2,
     # where sigma is the init logit spread, so the true centre sits just above
@@ -804,12 +1055,36 @@ def selftest():
     # mask_batch that forgot to mask at all passes every assert before this one.
     row = np.concatenate([[CLS_ID], rng.integers(N_SPECIAL, 500, 10), [SEP_ID], np.zeros(5, int)])
     rows_c = np.stack([row, row]).astype(np.int32)
-    mb = mask_batch(rows_c, rng, 0.30)
-    assert np.array_equal(mb["labels"] >= 0, mb["input_ids"] == MASK_ID), \
-        "labels disagree with [MASK] positions — the target set and the corruption have drifted apart"
-    assert (mb["labels"][mb["labels"] >= 0] >= N_SPECIAL).all(), "a special token was chosen as a target"
+    mb = mask_batch(rows_c, rng, 0.30, n_predictions(rows_c.shape[1], 0.30))
+    pos, kept = mb["positions"], mb["weights"] > 0
+    at_pos = np.take_along_axis(rows_c, pos, axis=1)
+    assert (at_pos[kept] >= N_SPECIAL).all(), "a special or PAD token was chosen as a target"
+    assert np.array_equal(mb["targets"][kept], at_pos[kept]), \
+        "targets do not match the tokens at the gathered positions"
+    assert (np.take_along_axis(mb["input_ids"], pos, axis=1)[kept] == MASK_ID).all(), \
+        "a scored position was not replaced by [MASK] in the input"
+    # ...and nothing else in the input moved
+    expected = np.zeros_like(rows_c, dtype=bool)
+    np.put_along_axis(expected, pos, kept, axis=1)
+    assert np.array_equal(mb["input_ids"] != rows_c, expected), \
+        "input_ids changed somewhere other than the scored positions"
     assert np.array_equal(mb["attention_mask"], (rows_c != PAD_ID).astype(np.int32)), "attention_mask is wrong"
-    assert not (mb["labels"][rows_c == PAD_ID] >= 0).any(), "a PAD position became a target"
+
+    # The guard on M1: gathering the scored positions must not change the
+    # objective. Scatter the targets back out and score every position the old
+    # way; the two losses must agree.
+    lab = np.full(rows.shape, -100, np.int32)
+    np.put_along_axis(lab, np.asarray(batch["positions"]),
+                      np.where(np.asarray(batch["weights"]) > 0,
+                               np.asarray(batch["targets"]), -100), axis=1)
+    lab = jnp.asarray(lab)
+    dense = full(batch["input_ids"], batch["attention_mask"])  # [B, L, vocab]
+    ce = optax.softmax_cross_entropy_with_integer_labels(
+        dense.astype(jnp.float32), jnp.where(lab >= 0, lab, 0))
+    wt = (lab >= 0).astype(jnp.float32)
+    dense_loss = float((ce * wt).sum() / jnp.maximum(wt.sum(), 1.0))
+    assert abs(dense_loss - loss) < 1e-4, \
+        f"gathered loss {loss:.6f} != full-width loss {dense_loss:.6f} — the gather changed the objective"
 
     # The optimizer path is otherwise never executed here. A few steps on one
     # fixed batch must drive the loss down; if they do not, gradients are not
@@ -817,7 +1092,8 @@ def selftest():
     small = MlmEncoder(cfg, rngs=nnx.Rngs(0))
     small.train()
     opt = make_optimizer(small, trapezoid_schedule(1e-3, 40))
-    fixed = to_device(mask_batch(rng.integers(N_SPECIAL, 500, (2, 16)).astype(np.int32), rng, 0.30), None)
+    fixed = to_device(mask_batch(rng.integers(N_SPECIAL, 500, (2, 16)).astype(np.int32),
+                                 rng, 0.30, n_predictions(16, 0.30)), None)
     first = float(train_step(small, opt, fixed))
     for _ in range(39):
         last = float(train_step(small, opt, fixed))
@@ -876,6 +1152,14 @@ def main():
     p.add_argument("--keep", type=int, default=10, help="checkpoints to retain")
     p.add_argument("--resume", action="store_true",
                    help="continue the run in --save-dir, Adam moments included")
+    p.add_argument("--remat", action="store_true",
+                   help="recompute block activations in the backward pass: large "
+                        "memory saving for roughly 4%% more compute")
+    p.add_argument("--tokenize-to", default="",
+                   help="write train/val ArrayRecord files to this directory and exit")
+    p.add_argument("--data-dir", default="",
+                   help="train from ArrayRecord files written by --tokenize-to, "
+                        "instead of building the corpus in memory")
     args = p.parse_args()
 
     print(f"smoke test: {args.smoke} ...")
@@ -885,48 +1169,61 @@ def main():
         return
 
     if args.smoke:
-        args.docs, args.seq_len = 200, 128
-        args.batch_size, args.layers, args.hidden, args.heads = 8, 4, 128, 4
-        args.log_every, args.eval_every, args.save_every = 5, 10, 15
-        # leave an explicit --steps alone, so --smoke --resume can be exercised
-        if args.steps == p.get_default("steps"):
-            args.steps = 30
+        # Only override what the caller left at its default, so a flag passed
+        # explicitly alongside --smoke still means what it says.
+        for name, value in [("docs", 200), ("seq_len", 128), ("steps", 30),
+                            ("batch_size", 8), ("layers", 4), ("hidden", 128),
+                            ("heads", 4), ("log_every", 5), ("eval_every", 10),
+                            ("save_every", 15)]:
+            if getattr(args, name) == p.get_default(name):
+                setattr(args, name, value)
 
-    print("building corpus ...", flush=True)
-    texts = list(iter_texts(args.dataset, args.config, args.docs, args.smoke))
+    if args.tokenize_to:
+        tokenize_to(args, args.tokenize_to)
+        return
 
-    if args.smoke:
-        tokenizer = ByteTokenizer()
-        vocab_size = ByteTokenizer.vocab
+    if args.data_dir:
+        # Pre-tokenised: windows stream off disk, so host RAM no longer caps the
+        # corpus and this session spends none of its time tokenising.
+        meta = read_meta(args.data_dir)
+        if meta["seq_len"] != args.seq_len:
+            raise RuntimeError(
+                f"{args.data_dir} was written at --seq-len {meta['seq_len']}, "
+                f"but this run asks for {args.seq_len}"
+            )
+        vocab_size, decode = meta["vocab_size"], True
+        train_source = grain.sources.ArrayRecordDataSource(
+            os.path.join(args.data_dir, "train.array_record"))
+        val_source = grain.sources.ArrayRecordDataSource(
+            os.path.join(args.data_dir, "val.array_record"))
+        print(f"corpus: {len(train_source)} train / {len(val_source)} val windows "
+              f"of {args.seq_len} tokens from {args.data_dir}, vocab {vocab_size}")
     else:
-        tokenizer = build_tokenizer(texts, args.vocab_size, args.tokenizer_path)
-        vocab_size = tokenizer.get_vocab_size()
+        print("building corpus ...", flush=True)
+        texts = list(iter_texts(args.dataset, args.config, args.docs, args.smoke))
+        tokenizer = (ByteTokenizer() if args.smoke
+                     else build_tokenizer(texts, args.vocab_size, args.tokenizer_path))
+        vocab_size = (ByteTokenizer.vocab if args.smoke else tokenizer.get_vocab_size())
 
-    chunks, doc_ids = chunk_documents(texts, tokenizer, args.seq_len, with_doc_ids=True)
-    print(f"corpus: {len(texts)} docs -> {len(chunks)} sequences of {args.seq_len} tokens "
-          f"({len(chunks) * args.seq_len / 1e6:.2f}M tokens), vocab {vocab_size}")
-    del texts  # gigabytes of Python strings at --docs 200000, and dead from here
+        n_texts = len(texts)
+        chunks, doc_ids = chunk_documents(texts, tokenizer, args.seq_len,
+                                          with_doc_ids=True, consume=True)
+        print(f"corpus: {n_texts} docs -> {len(chunks)} sequences of {args.seq_len} tokens "
+              f"({len(chunks) * args.seq_len / 1e6:.2f}M tokens), vocab {vocab_size}")
+        del texts  # already drained by consume=True; drop the empty list too
 
-    # Hold out whole *documents* before training touches them. Splitting on
-    # windows instead would drop two chunks of the same article on opposite
-    # sides, and the held-out loss would read back part of the training set.
-    n_docs = int(doc_ids.max()) + 1
-    doc_perm = np.random.default_rng(args.seed).permutation(n_docs)
-    n_val_docs = max(1, int(round(n_docs * args.val_frac)))
-    want = args.batch_size * MIN_VAL_BATCHES
-    while True:
-        is_val = np.isin(doc_ids, doc_perm[:n_val_docs])
-        if is_val.sum() >= want or n_val_docs >= n_docs // 2:
-            break
-        n_val_docs = min(n_val_docs * 2, n_docs // 2)
-    val_chunks, train_chunks = chunks[is_val], chunks[~is_val]
-    if len(val_chunks) < args.batch_size or len(train_chunks) < args.batch_size:
-        raise RuntimeError(
-            f"corpus too small to split: {len(chunks)} windows from {n_docs} docs, "
-            f"batch {args.batch_size}"
-        )
-    print(f"split: {len(train_chunks)} train / {len(val_chunks)} held-out windows "
-          f"({n_val_docs}/{n_docs} documents held out)")
+        is_val, n_val_docs, n_docs = split_by_document(
+            doc_ids, args.val_frac, args.batch_size, args.seed)
+        train_source, val_source, decode = chunks[~is_val], chunks[is_val], False
+        # the fancy-indexed halves above are copies; without this the whole
+        # corpus stays resident twice for the life of the run
+        del chunks, doc_ids, is_val
+        if len(val_source) < args.batch_size or len(train_source) < args.batch_size:
+            raise RuntimeError(
+                f"corpus too small to split: {n_docs} docs, batch {args.batch_size}"
+            )
+        print(f"split: {len(train_source)} train / {len(val_source)} held-out windows "
+              f"({n_val_docs}/{n_docs} documents held out)")
 
     # Built before the model because resuming has to rebuild the optimizer with
     # the *same* tx, and the schedule is baked into it.
@@ -960,6 +1257,7 @@ def main():
             max_len=args.seq_len,
             dropout=args.dropout,
             dtype=getattr(jnp, args.dtype),
+            remat=args.remat,
         )
         model = MlmEncoder(cfg, rngs=nnx.Rngs(args.seed))
         model.train()
@@ -983,10 +1281,16 @@ def main():
         # that the checkpoints already in the directory were trained under.
         save_config(args.save_dir, cfg)
 
-    # Offset the stream seed by the resume point so a continued run does not
-    # replay the batches it already saw.
-    stream = prefetch(batch_stream(train_chunks, args.batch_size, args.mask_prob,
-                                   seed=args.seed + 1 + start_step, sharding=data_sharding))
+    n_pred = n_predictions(args.seq_len, args.mask_prob)
+    train_ds = make_dataset(train_source, args.batch_size, args.mask_prob, n_pred,
+                            args.seed + 1, decode=decode)
+    val_ds = make_dataset(val_source, args.batch_size, args.mask_prob, n_pred,
+                          args.seed + 2, decode=decode, repeat=False)
+    data_iter = iter(device_stream(train_ds, data_sharding))
+    if args.resume:
+        # The whole point of checkpointing the iterator: restore the exact
+        # position rather than reseeding into a different stream.
+        restore_data_iter(args.save_dir, data_iter, start_step)
 
     tokens_per_step = args.batch_size * args.seq_len
     print(f"training steps {start_step + 1}..{args.steps} at {args.mask_prob:.0%} masking, "
@@ -994,7 +1298,7 @@ def main():
 
     start = time.time()
     for step in range(start_step + 1, args.steps + 1):
-        batch = next(stream)
+        batch = next(data_iter)
         loss = train_step(model, optimizer, batch)
         if step % args.log_every == 0 or step == start_step + 1:
             loss = float(loss)
@@ -1006,21 +1310,25 @@ def main():
                   f"{done * tokens_per_step / max(elapsed, 1e-6) / 1e3:6.1f}k tok/s",
                   flush=True)
         if args.eval_every and step % args.eval_every == 0:
-            model.eval()
-            val = evaluate(model, val_chunks, args.batch_size, args.mask_prob,
-                           sharding=data_sharding)
-            model.train()
+            # `deterministic` is static, so toggling it compiles a second copy of
+            # the whole 12-layer graph. At dropout 0.0 the two are identical, so
+            # skip the toggle and the extra compile with it.
+            if cfg.dropout > 0.0:
+                model.eval()
+            val = evaluate(model, device_stream(val_ds, data_sharding))
+            if cfg.dropout > 0.0:
+                model.train()
             print(f"step {step:>6}  held-out loss {val:6.3f}  (train {float(loss):6.3f})",
                   flush=True)
         if mgr is not None and args.save_every and step % args.save_every == 0:
-            save_checkpoint(mgr, step, model, optimizer)
+            save_checkpoint(mgr, step, model, optimizer, data_iter)
 
     model.eval()
-    final = evaluate(model, val_chunks, args.batch_size, args.mask_prob, sharding=data_sharding)
+    final = evaluate(model, device_stream(val_ds, data_sharding))
     print(f"final held-out mlm loss {final:.3f}")
 
     if mgr is not None:
-        save_checkpoint(mgr, args.steps, model, optimizer)
+        save_checkpoint(mgr, args.steps, model, optimizer, data_iter)
         mgr.wait_until_finished()
         print(f"checkpoints in {os.path.abspath(args.save_dir)}: steps {mgr.all_steps()}")
         mgr.close()
@@ -1036,9 +1344,11 @@ def main():
     # vectors are good. MLM puts no loss on the aggregate of a sequence, so the
     # pooled space comes out anisotropic and similarity is dominated by token
     # frequency — a contrastive stage is what actually shapes it.
-    rows = val_chunks[:args.batch_size]
+    rows = np.stack([np.asarray(val_source[i]) if not decode
+                     else decode_record(val_source[i])
+                     for i in range(args.batch_size)])
     batch = to_device({"ids": rows, "am": (rows != PAD_ID).astype(np.int32)}, data_sharding)
-    hidden = model.encode(batch["ids"], batch["am"])
+    hidden = nnx.jit(lambda m, i, a: m.encode(i, a))(model, batch["ids"], batch["am"])
     w = (batch["ids"] >= N_SPECIAL)[..., None].astype(hidden.dtype)
     pooled = (hidden * w).sum(1) / jnp.maximum(w.sum(1), 1.0)
     print(f"pooled embedding shape {pooled.shape}")

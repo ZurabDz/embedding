@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 
 def l2_normalize(x: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
+    """The one jnp unit-normalize (both students emit through it, and the
+    losses re-apply it, so the epsilon must be one value everywhere)."""
     return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + eps)
 
 
@@ -111,3 +114,13 @@ class EmbeddingModel(nnx.Module):
 
 def param_count(model: nnx.Module) -> int:
     return int(sum(x.size for x in jax.tree_util.tree_leaves(nnx.state(model, nnx.Param))))
+
+
+def embed_in_batches(model, tokens, mask, batch: int = 256) -> np.ndarray:
+    """Run a student over all rows (deterministic) and stack the embeddings."""
+    outs = []
+    for i in range(0, tokens.shape[0], batch):
+        e = model(jnp.asarray(tokens[i : i + batch]),
+                  jnp.asarray(mask[i : i + batch]), deterministic=True)
+        outs.append(np.asarray(e))
+    return np.concatenate(outs, axis=0)

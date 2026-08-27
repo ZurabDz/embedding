@@ -8,11 +8,12 @@ Caching
   (model, input_type, output_dim, text). Re-runs and interrupted runs resume for
   free, and switching teacher/settings never reuses a stale vector.
 
-Rate limiting (defaults match the Gemini free tier for this model)
+Rate limiting
   --rpm  requests per minute  — sliding-window throttle, sleeps as needed
   --tpm  tokens   per minute  — sliding-window throttle, tokens estimated locally
   --rpd  requests per day     — hard cap; usage is tracked in artifacts/teacher_usage.json
                                 so several runs in one day share the same budget
+                                (on the free tier pass --rpd 1000)
   When the daily cap is reached (or you Ctrl-C, or the server keeps returning 429),
   the script stops *gracefully*: it saves whatever it embedded so far and records
   metadata describing the partial coverage. Run it again (e.g. tomorrow, after the
@@ -20,18 +21,15 @@ Rate limiting (defaults match the Gemini free tier for this model)
 
 Partial coverage
   If not everything fits in your quota, artifacts/{sentences.json, teacher_emb.npy}
-  hold only the embedded subset (kept aligned 1:1 so train.py/eval.py just work),
-  and artifacts/teacher_meta.json records how much of the input was covered.
+  hold only the embedded subset (kept aligned 1:1 so train/eval just work), and
+  artifacts/teacher_meta.json records how much of the input was covered.
 
-Usage:
-    export GEMINI_API_KEY=AIza...
-    python embed_teacher.py --batch_size 16 --input_type passage
-    # quick test slice (only ~20 requests):   add  --rpd 20
-    # cheaper/smaller cache (Matryoshka):      add  --output_dim 768
+The offline stand-in (`geo-distill synthetic-teacher`, run_synthetic below)
+fabricates a *structured* teacher signal from bag-of-token counts, so the whole
+pipeline runs without an API key or credits.
 """
 from __future__ import annotations
 
-import argparse
 import datetime
 import hashlib
 import json
@@ -41,20 +39,12 @@ from collections import deque
 from pathlib import Path
 
 import numpy as np
-from google import genai
-from google.genai import types
 
-from dotenv import load_dotenv
+from geo_distill.checkpoint import atomic_np_save, atomic_write_text
 
-# The key lives in the project-root .dotenv (not the default ".env"), so point
-# python-dotenv at it explicitly — anchored to this file so it works from any CWD.
-load_dotenv(Path(__file__).resolve().parents[1] / ".dotenv")
-
-MODEL = "gemini-embedding-2"
-
-# The old NVIDIA teacher exposed a passage/query "input_type"; Gemini expresses
-# the same asymmetry through task types, so we map onto those. (Gemini offers
-# others too, e.g. SEMANTIC_SIMILARITY / CLUSTERING — swap here to experiment.)
+# The passage/query "input_type" asymmetry maps onto Gemini task types. (Gemini
+# offers others too, e.g. SEMANTIC_SIMILARITY / CLUSTERING — swap here to
+# experiment.)
 TASK_TYPES = {"passage": "RETRIEVAL_DOCUMENT", "query": "RETRIEVAL_QUERY"}
 
 
@@ -81,11 +71,13 @@ def _l2norm(vec):
     return arr.tolist()
 
 
-def embed_batch(client, texts, input_type, output_dim):
+def embed_batch(client, texts, model: str, input_type: str, output_dim):
+    from google.genai import types
+
     cfg = types.EmbedContentConfig(task_type=TASK_TYPES[input_type])
     if output_dim:
         cfg.output_dimensionality = output_dim
-    resp = client.models.embed_content(model=MODEL, contents=list(texts), config=cfg)
+    resp = client.models.embed_content(model=model, contents=list(texts), config=cfg)
     # Gemini returns embeddings in the same order as `contents`.
     embs = [e.values for e in resp.embeddings]
     # Full-dimensional output is already L2-normalized; truncated (Matryoshka)
@@ -191,20 +183,6 @@ class RateLimiter:
         self._save_usage()
 
 
-def _atomic_np_save(path, arr):
-    tmp = f"{path}.tmp"
-    with open(tmp, "wb") as f:
-        np.save(f, arr)
-    os.replace(tmp, path)  # atomic rename so a concurrent train.py never reads a torn file
-
-
-def _atomic_write_text(path, text):
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
-
-
 def finalize(sentences, cache, kfn, args) -> dict:
     """Write the embedded subset (aligned) + coverage metadata. Handles partial runs."""
     embedded = [s for s in sentences if kfn(s) in cache]
@@ -212,12 +190,12 @@ def finalize(sentences, cache, kfn, args) -> dict:
         mat = np.array([cache[kfn(s)] for s in embedded], dtype=np.float32)
     else:
         mat = np.zeros((0, 0), dtype=np.float32)
-    _atomic_np_save(args.out_emb, mat)
-    _atomic_write_text(args.out_sents, json.dumps(embedded, ensure_ascii=False))
+    atomic_np_save(args.out_emb, mat)
+    atomic_write_text(args.out_sents, json.dumps(embedded, ensure_ascii=False))
 
     dim = int(mat.shape[1]) if mat.ndim == 2 and mat.shape[1] else None
     meta = {
-        "model": MODEL,
+        "model": args.model,
         "input_type": args.input_type,
         "output_dim_requested": args.output_dim,
         "embedding_dim": dim,
@@ -228,36 +206,18 @@ def finalize(sentences, cache, kfn, args) -> dict:
         "complete": len(embedded) == len(sentences),
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
     }
-    _atomic_write_text(args.out_meta, json.dumps(meta, ensure_ascii=False, indent=2))
+    atomic_write_text(args.out_meta, json.dumps(meta, ensure_ascii=False, indent=2))
     return meta
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="data/sentences.txt")
-    ap.add_argument("--cache", default="artifacts/teacher_cache.jsonl")
-    ap.add_argument("--out_emb", default="artifacts/teacher_emb.npy")
-    ap.add_argument("--out_sents", default="artifacts/sentences.json")
-    ap.add_argument("--out_meta", default="artifacts/teacher_meta.json")
-    ap.add_argument("--usage", default="artifacts/teacher_usage.json")
-    ap.add_argument("--batch_size", type=int, default=4)
-    ap.add_argument("--input_type", default="passage", choices=["passage", "query"],
-                    help="Use one consistent type for the whole corpus.")
-    ap.add_argument("--output_dim", type=int, default=None,
-                    help="Truncate the embedding (Matryoshka). Default: full.")
-    # Rate limits — defaults match the Gemini free tier for this model. Set any to 0
-    # to disable that dimension.
-    ap.add_argument("--rpm", type=int, default=100, help="requests per minute (0=off)")
-    ap.add_argument("--tpm", type=int, default=30000, help="tokens per minute (0=off)")
-    ap.add_argument("--rpd", type=int, default=100000, help="requests per day (0=off)")
-    ap.add_argument("--chars_per_token", type=float, default=3.0,
-                    help="local char->token ratio used only for the TPM budget")
-    ap.add_argument("--max_retries", type=int, default=6,
-                    help="consecutive 429s tolerated before stopping gracefully")
-    ap.add_argument("--checkpoint_every", type=int, default=500,
-                    help="snapshot teacher_emb.npy/sentences.json/meta every N new "
-                         "embeddings so a running train.py sees partial progress (0=only at end)")
-    args = ap.parse_args()
+def run(args) -> None:
+    from google import genai
+    from dotenv import load_dotenv
+
+    # The key lives in the repo-root .dotenv (not the default ".env"), so point
+    # python-dotenv at it explicitly — anchored to this file so it works from
+    # any CWD. parents: [0]=geo_distill pkg, [1]=geo_distill project, [2]=repo.
+    load_dotenv(Path(__file__).resolve().parents[2] / ".dotenv")
 
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
@@ -271,12 +231,12 @@ def main():
     cache = load_cache(args.cache)
 
     def kfn(text):
-        return key(text, args.input_type, MODEL, args.output_dim)
+        return key(text, args.input_type, args.model, args.output_dim)
 
     todo = [s for s in sentences if kfn(s) not in cache]
     limiter = RateLimiter(args.rpm, args.tpm, args.rpd, args.usage)
     print(f"{len(sentences)} sentences | {len(cache)} cached | {len(todo)} to embed "
-          f"(input_type={args.input_type})")
+          f"(model={args.model}, input_type={args.input_type})")
     print(f"limits: {args.rpm or '∞'} req/min · {args.tpm or '∞'} tok/min · "
           f"{args.rpd or '∞'} req/day  (daily budget remaining: {limiter.daily_remaining()})")
 
@@ -297,7 +257,8 @@ def main():
                 break
 
             try:
-                embs = embed_batch(client, batch, args.input_type, args.output_dim)
+                embs = embed_batch(client, batch, args.model, args.input_type,
+                                   args.output_dim)
             except Exception as exc:  # noqa: BLE001
                 if is_rate_limited(exc):
                     consecutive_429 += 1
@@ -335,7 +296,7 @@ def main():
             if args.checkpoint_every and since_ckpt >= args.checkpoint_every:
                 snap = finalize(sentences, cache, kfn, args)
                 since_ckpt = 0
-                print(f"\n  ↳ checkpoint: {snap['embedded']} embedded "
+                print(f"\n  checkpoint: {snap['embedded']} embedded "
                       f"({snap['coverage'] * 100:.1f}%) written to {args.out_emb}")
     except KeyboardInterrupt:
         stop_reason = "interrupted (Ctrl-C)"
@@ -345,9 +306,9 @@ def main():
     meta = finalize(sentences, cache, kfn, args)
     print()
     if meta["complete"]:
-        print(f"✅ Embedded all {meta['embedded']} sentences | dim {meta['embedding_dim']}")
+        print(f"Embedded all {meta['embedded']} sentences | dim {meta['embedding_dim']}")
     else:
-        print(f"⏸  Partial: {meta['embedded']}/{meta['input_total']} "
+        print(f"Partial: {meta['embedded']}/{meta['input_total']} "
               f"({meta['coverage'] * 100:.1f}%) embedded"
               + (f" | dim {meta['embedding_dim']}" if meta['embedding_dim'] else ""))
         if stop_reason:
@@ -356,5 +317,31 @@ def main():
     print(f"   wrote {args.out_emb} · {args.out_sents} · {args.out_meta}")
 
 
-if __name__ == "__main__":
-    main()
+def run_synthetic(args) -> None:
+    """OFFLINE stand-in for the teacher endpoint, so the whole pipeline runs
+    without spending any API credits. It fabricates a *structured* signal the
+    student can actually learn: a random projection of L2-normalized
+    bag-of-token counts, so sentences that share subwords get similar vectors.
+    """
+    from geo_distill.data import load_tokenizer
+
+    tok = load_tokenizer(args.tokenizer)
+    with open(args.input, encoding="utf-8") as f:
+        sents = [ln.strip() for ln in f if ln.strip()]
+
+    v = tok.get_vocab_size()
+    bow = np.zeros((len(sents), v), dtype=np.float32)
+    for i, enc in enumerate(tok.encode_batch(sents)):
+        for t in enc.ids:
+            bow[i, t] += 1.0
+    bow /= (np.linalg.norm(bow, axis=1, keepdims=True) + 1e-8)
+
+    rng = np.random.default_rng(args.seed)
+    proj = rng.standard_normal((v, args.dim)).astype(np.float32) / np.sqrt(v)
+    teacher = bow @ proj + 0.01 * rng.standard_normal(
+        (len(sents), args.dim)).astype(np.float32)
+
+    os.makedirs(os.path.dirname(args.out_emb) or ".", exist_ok=True)
+    atomic_np_save(args.out_emb, teacher.astype(np.float32))
+    atomic_write_text(args.out_sents, json.dumps(sents, ensure_ascii=False))
+    print("synthetic teacher:", teacher.shape, "| sentences:", len(sents))

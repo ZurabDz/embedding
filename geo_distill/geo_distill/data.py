@@ -1,19 +1,15 @@
-"""Download Georgian text from HuggingFace and turn it into clean sentences.
-
-Default source: ZurabDz/geo_small_corpus. You can use any dataset with a text column.
-
-Output: data/sentences.txt  (one sentence per line, deduplicated, length-filtered)
-
-Usage:
-    python data.py --n 20000
-    python data.py --dataset <corpus_name> --n 50000
+"""Corpus download and the text -> arrays helpers every stage shares:
+tokenizer loading, batch encoding for the from-scratch student, and the
+stable content-based train/val split.
 """
 from __future__ import annotations
 
-import argparse
+import hashlib
 import os
 import re
 import sys
+
+import numpy as np
 
 # Sentence enders: Latin-style punctuation (used in modern Georgian) + newlines.
 _SENT_SPLIT = re.compile(r"(?<=[.!?…])\s+|\n+")
@@ -22,6 +18,75 @@ _HAS_GEORGIAN = re.compile(r"[\u10D0-\u10FF]")
 _WS = re.compile(r"\s+")
 
 
+# --------------------------------------------------------------------------- #
+# Tokenizer loading + encoding
+# --------------------------------------------------------------------------- #
+def load_tokenizer(spec: str):
+    """A tokenizers-JSON file path, or a Hub repo id (e.g. ZurabDz/ka-bpe-32k).
+
+    Hub ids resolve through mlm.hub, which also gets authentication right for
+    private repos: the Colab secrets vault, HF_TOKEN, and the token file
+    written by `hf auth login` are all honoured.
+    """
+    from tokenizers import Tokenizer
+
+    if os.path.isfile(spec):
+        return Tokenizer.from_file(spec)
+    from mlm import hub
+
+    if hub.is_hub_id(spec):
+        return hub.load_hub_tokenizer(spec)
+    raise FileNotFoundError(f"tokenizer not found: {spec}")
+
+
+def encode_batch(tokenizer, sentences, max_len: int, pad_id: int = 0):
+    """Turn a list of strings into (tokens, pad_mask) numpy arrays.
+
+    tokens:   (N, max_len) int32, right-padded with pad_id
+    pad_mask: (N, max_len) float32, 1 for real tokens and 0 for padding
+    """
+    n = len(sentences)
+    tokens = np.full((n, max_len), pad_id, dtype=np.int32)
+    mask = np.zeros((n, max_len), dtype=np.float32)
+    for i, enc in enumerate(tokenizer.encode_batch(list(sentences))):
+        ids = enc.ids[:max_len]
+        tokens[i, : len(ids)] = ids
+        mask[i, : len(ids)] = 1.0
+    return tokens, mask
+
+
+# --------------------------------------------------------------------------- #
+# Train / val split
+# --------------------------------------------------------------------------- #
+def val_split(sentences, val_frac: float, seed: int = 0):
+    """Deterministic, content-based train/val split.
+
+    A sentence lands in val or train based only on a hash of its *text* (plus the
+    seed) — never on the dataset's size or order. So as you embed more data, every
+    already-seen sentence keeps its assignment and the validation set stays stable,
+    which makes metrics comparable across runs with different amounts of data.
+    (The old random-permutation split re-drew a different val set every run, so the
+    score moved as much because of the changing benchmark as the model.)
+
+    Returns (train_idx, val_idx) as int arrays.
+    """
+    thr = int(val_frac * 1_000_000)
+    train_idx, val_idx = [], []
+    for i, s in enumerate(sentences):
+        h = int(hashlib.sha1(f"{seed}\x00{s}".encode("utf-8")).hexdigest(), 16)
+        (val_idx if (h % 1_000_000) < thr else train_idx).append(i)
+    # Guard tiny corpora so neither split is ever empty.
+    if len(val_idx) < 2 or not train_idx:
+        rng = np.random.default_rng(seed)
+        perm = rng.permutation(len(sentences))
+        n_val = max(2, int(len(sentences) * val_frac))
+        val_idx, train_idx = perm[:n_val].tolist(), perm[n_val:].tolist()
+    return np.array(train_idx), np.array(val_idx)
+
+
+# --------------------------------------------------------------------------- #
+# Corpus download (the `data` subcommand)
+# --------------------------------------------------------------------------- #
 def pick_text_column(features) -> str:
     names = list(features.keys())
     for pref in ("text", "content", "sentence", "body", "raw"):
@@ -41,18 +106,9 @@ def to_sentences(text: str, min_chars: int, max_chars: int):
             yield s
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="ZurabDz/geo_small_corpus")
-    ap.add_argument("--split", default="train")
-    ap.add_argument("--n", type=int, default=20000, help="target number of sentences")
-    ap.add_argument("--min_chars", type=int, default=20)
-    ap.add_argument("--max_chars", type=int, default=300)
-    ap.add_argument("--out", default="data/sentences.txt")
-    ap.add_argument("--seed", type=int, default=0)
-    args = ap.parse_args()
-
-    from datasets import load_dataset  # imported here so --help works without it
+def run(args) -> None:
+    """Stream a HF dataset and write clean, deduplicated Georgian sentences."""
+    from datasets import load_dataset
 
     # Stream so we don't download the whole thing when we only need a slice.
     ds = load_dataset(args.dataset, split=args.split, streaming=True)
@@ -87,7 +143,3 @@ def main():
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)
-
-
-if __name__ == "__main__":
-    main()

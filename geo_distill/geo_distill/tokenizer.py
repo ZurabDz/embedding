@@ -6,72 +6,52 @@ occur in Georgian instead of wasting it on the whole world's scripts.
 
 Two flavours:
   bpe      byte-level BPE — never produces [UNK], but Georgian is 3 bytes per
-           character in UTF-8, so tokens are byte fragments.
+           character in UTF-8, so tokens are byte fragments. Delegates to the
+           shared mlm recipe, so it is the exact trainer lm pretraining uses.
   unigram  character-level Unigram (NFKC-normalized) — tokens are natural
            character/subword units, usually a better fit for Georgian script.
 
-Output: artifacts/tokenizer.json
-
-Usage:
-    python train_tokenizer.py --vocab_size 12000
-    python train_tokenizer.py --model unigram --vocab_size 8000
+Both flavours reserve mlm's five special tokens at ids 0..4, so any tokenizer
+trained here also satisfies the MLM student's contract (--mlm-checkpoint).
 """
 from __future__ import annotations
 
-import argparse
 import os
 
-from tokenizers import (Tokenizer, models, trainers, pre_tokenizers, decoders,
-                        normalizers)
+from mlm import SPECIAL_TOKENS, assert_special_tokens
+from mlm.tokenizer import train_bpe
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="data/sentences.txt")
-    ap.add_argument("--out", default="artifacts/tokenizer.json")
-    ap.add_argument("--model", default="bpe", choices=["bpe", "unigram"])
-    ap.add_argument("--vocab_size", type=int, default=12000)
-    ap.add_argument("--min_frequency", type=int, default=2)
-    args = ap.parse_args()
-
-    # [PAD] must be id 0 — encode_batch pads with 0.
-    special = ["[PAD]", "[UNK]"]
+def run(args) -> None:
+    with open(args.input, encoding="utf-8") as f:
+        texts = [ln.strip() for ln in f if ln.strip()]
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     if args.model == "bpe":
-        tok = Tokenizer(models.BPE(unk_token="[UNK]"))
-        # Byte-level handles any Unicode (incl. Georgian) with no [UNK] surprises.
-        tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
-        tok.decoder = decoders.ByteLevel()
-        trainer = trainers.BpeTrainer(
-            vocab_size=args.vocab_size,
-            min_frequency=args.min_frequency,
-            special_tokens=special,
-            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
-        )
+        tok = train_bpe(texts, args.vocab_size, args.out,
+                        min_frequency=args.min_frequency)
     else:
+        from tokenizers import (Tokenizer, decoders, models, normalizers,
+                                pre_tokenizers, trainers)
+
         tok = Tokenizer(models.Unigram())
         tok.normalizer = normalizers.NFKC()
         tok.pre_tokenizer = pre_tokenizers.Metaspace()
         tok.decoder = decoders.Metaspace()
         trainer = trainers.UnigramTrainer(
             vocab_size=args.vocab_size,
-            special_tokens=special,
+            special_tokens=SPECIAL_TOKENS,  # same five, same order, ids 0..4
             unk_token="[UNK]",
         )
+        tok.train_from_iterator(texts, trainer)
+        tok.save(args.out)
+        assert_special_tokens(tok, context=args.out)
 
-    tok.train([args.input], trainer)
-
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    tok.save(args.out)
     print(f"Vocab size: {tok.get_vocab_size()}  ->  {args.out}")
-    print("[PAD] id:", tok.token_to_id("[PAD]"), " [UNK] id:", tok.token_to_id("[UNK]"))
+    print("special ids:", {t: tok.token_to_id(t) for t in SPECIAL_TOKENS})
 
     demo = "ქართული ენა ლამაზია."
     enc = tok.encode(demo)
     print("Demo:", demo)
     print("  ids   :", enc.ids)
     print("  tokens:", enc.tokens)
-
-
-if __name__ == "__main__":
-    main()

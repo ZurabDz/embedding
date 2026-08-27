@@ -1,0 +1,30 @@
+[project]
+name = "geo-distill"
+version = "0.1.0"
+description = "Distill Gemini teacher embeddings into a small Georgian student model"
+requires-python = ">=3.12"
+dependencies = [
+    "ka-mlm",                    # the pretrained encoder + shared tokenizer/hub/encoding surface
+    "flax>=0.12",
+    "optax>=0.2",
+    "numpy",
+    "tokenizers>=0.20",
+    "datasets>=3.0",             # only the `data` subcommand
+    "huggingface-hub>=0.20",
+    "orbax-checkpoint>=0.11",    # restoring lm checkpoints (--mlm-checkpoint)
+    "google-genai>=1.0",         # only the `teacher` subcommand
+    "python-dotenv>=1.0",        # only the `teacher` subcommand (.dotenv key loading)
+]
+
+[project.scripts]
+geo-distill = "geo_distill.cli:main"
+
+[tool.uv.sources]
+ka-mlm = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["geo_distill"]

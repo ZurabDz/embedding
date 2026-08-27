@@ -22,6 +22,11 @@ dev = [
 # members editable plus the dev group; the members are the real packages.
 package = false
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: end-to-end subprocess pipelines (run with -m slow)"]
+addopts = "-m 'not slow'"
+
 [tool.uv.workspace]
 members = ["lm", "geo_distill"]
 

@@ -1,6 +1,9 @@
-"""Dynamic MLM masking: 30% of maskable positions -> [MASK], no 80/10/10."""
+"""Dynamic MLM masking: 30% of maskable positions -> [MASK], no 80/10/10.
 
-import grain
+Pure numpy on purpose — the grain adapter (MaskExample) lives with the rest of
+the grain pipeline in mlm.data, so this module imports on a lean install.
+"""
+
 import numpy as np
 
 from mlm.config import MASK_ID, N_SPECIAL, PAD_ID
@@ -51,22 +54,3 @@ def mask_batch(rows: np.ndarray, rng: np.random.Generator, mask_prob: float,
         "targets": np.where(keep, chosen, 0).astype(np.int32),
         "weights": keep.astype(np.float32),
     }
-
-
-class MaskExample(grain.transforms.RandomMap):
-    """Per-example dynamic masking.
-
-    Grain derives this element's RNG from its index by resetting a Philox
-    counter, so the mask a given window receives is a pure function of that
-    index. Two consequences worth having: changing --batch-size no longer
-    changes every mask, and a resumed run reproduces masks exactly rather than
-    relying on the RNG state having been checkpointed.
-    """
-
-    def __init__(self, mask_prob: float, n_pred: int):
-        self.mask_prob = mask_prob
-        self.n_pred = n_pred
-
-    def random_map(self, row, rng):
-        out = mask_batch(row, rng, self.mask_prob, self.n_pred)
-        return {k: v[0] for k, v in out.items()}  # drop the batch axis

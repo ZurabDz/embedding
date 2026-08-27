@@ -4,7 +4,6 @@ import dataclasses
 import json
 import os
 
-import jax.numpy as jnp
 from flax import nnx
 
 from mlm.config import EncoderConfig
@@ -15,22 +14,13 @@ from mlm.optim import make_optimizer
 def save_config(save_dir: str, cfg: EncoderConfig) -> None:
     """The config is not part of the orbax tree, and without it there is nothing
     to rebuild the model into before restoring."""
-    d = dataclasses.asdict(cfg)
-    for k in ("dtype", "param_dtype"):
-        d[k] = getattr(cfg, k).__name__
     with open(os.path.join(save_dir, "config.json"), "w") as f:
-        json.dump(d, f, indent=2)
+        json.dump(cfg.to_json_dict(), f, indent=2)
 
 
 def load_config(save_dir: str) -> EncoderConfig:
     with open(os.path.join(save_dir, "config.json")) as f:
-        d = json.load(f)
-    # param_dtype is absent from configs written before it was split out; the
-    # dataclass default (fp32) is the right answer for those.
-    for k in ("dtype", "param_dtype"):
-        if k in d:
-            d[k] = getattr(jnp, d[k])
-    return EncoderConfig(**d)
+        return EncoderConfig.from_json_dict(json.load(f))
 
 
 def checkpoint_manager(save_dir: str, keep: int = 10):

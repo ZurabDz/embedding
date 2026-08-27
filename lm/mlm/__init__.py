@@ -30,15 +30,24 @@ the data stream, so a resumed run matches an uninterrupted one:
 
 For downstream fine-tuning, the public surface is:
     from mlm import EncoderConfig, MlmEncoder, load_checkpoint
+    from mlm import encode_sentences, pool_content, assert_special_tokens
+
+Importing `mlm` deliberately needs only jax/flax/optax (+ numpy): the grain
+input pipeline, orbax, datasets and huggingface_hub load lazily inside the
+functions that use them, so a fine-tuning environment stays lean.
 """
 
 from mlm.config import (CLS_ID, MASK_ID, N_SPECIAL, PAD_ID, SEP_ID,
                         SPECIAL_TOKENS, UNK_ID, EncoderConfig)
+from mlm.encoding import cls_row, encode_sentences, pool_content
 from mlm.model import MlmEncoder, count_params, mlm_loss
 from mlm.checkpoint import load_checkpoint, resume_checkpoint
+from mlm.tokenizer import assert_pad_is_zero, assert_special_tokens
 
 __all__ = [
     "CLS_ID", "MASK_ID", "N_SPECIAL", "PAD_ID", "SEP_ID", "SPECIAL_TOKENS",
     "UNK_ID", "EncoderConfig", "MlmEncoder", "count_params", "mlm_loss",
     "load_checkpoint", "resume_checkpoint",
+    "cls_row", "encode_sentences", "pool_content",
+    "assert_pad_is_zero", "assert_special_tokens",
 ]

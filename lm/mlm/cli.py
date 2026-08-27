@@ -17,7 +17,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--docs", type=int, default=20_000,
                    help="documents to keep (rows under 200 characters are "
                         "filtered before counting)")
-    p.add_argument("--tokenizer-path", default="ka_bpe.json")
+    p.add_argument("--tokenizer-path", default="ka_bpe.json",
+                   help="tokenizer to use: an existing local tokenizers-JSON "
+                        "file or a directory holding tokenizer.json, an "
+                        "hf://user/repo or bare user/repo Hub id (tokenizer.json "
+                        "is downloaded, never retrained; a bare id whose parent "
+                        "dir exists locally is treated as a path), or a "
+                        "not-yet-existing path to train a fresh BPE into")
+    p.add_argument("--push-tokenizer-to", default="",
+                   help="Hub repo id (user/repo) to upload the trained "
+                        "tokenizer to as tokenizer.json; needs a write token "
+                        "in the HF_TOKEN env var, and creates the repo "
+                        "*private* on first push")
     p.add_argument("--vocab-size", type=int, default=32_000)
     p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--batch-size", type=int, default=16)
@@ -46,7 +57,19 @@ def build_parser() -> argparse.ArgumentParser:
     # which is exactly what the trapezoid schedule exists to let you fork from.
     p.add_argument("--keep", type=int, default=10, help="checkpoints to retain")
     p.add_argument("--resume", action="store_true",
-                   help="continue the run in --save-dir, Adam moments included")
+                   help="continue the run in --save-dir, Adam moments included; "
+                        "with --hub-checkpoints, the repo's checkpoint is pulled "
+                        "first when it is newer than anything local")
+    p.add_argument("--hub-checkpoints", default="",
+                   help="Hub repo id (user/repo) to sync checkpoints with: every "
+                        "pushed checkpoint atomically replaces the repo's previous "
+                        "one (created private; needs a write token), and --resume "
+                        "pulls it back — the same command then chains across "
+                        "capped Kaggle/Colab sessions")
+    p.add_argument("--push-every", type=int, default=0,
+                   help="push to --hub-checkpoints every N steps (a multiple of "
+                        "--save-every); 0 pushes only the final checkpoint. Each "
+                        "push blocks training while it uploads")
     p.add_argument("--remat", action="store_true",
                    help="recompute block activations in the backward pass: large "
                         "memory saving for roughly 4%% more compute")
@@ -76,6 +99,26 @@ def main(argv=None) -> None:
     except (AttributeError, ValueError):
         pass
 
+    if args.push_tokenizer_to:
+        # Fail before any corpus work, not an hour into it.
+        from mlm.hub import ensure_writable, hf_token
+
+        if args.data_dir:
+            p.error("--push-tokenizer-to does nothing with --data-dir: the "
+                    "corpus is already tokenised; push during --tokenize-to "
+                    "or an in-memory run instead")
+        if hf_token() is None:
+            p.error("--push-tokenizer-to needs a Hugging Face write token: "
+                    "set HF_TOKEN, or run `hf auth login`")
+        if not args.smoke:
+            # One round-trip that also validates the token's *write* scope and
+            # the namespace — presence alone lets a read-scoped Kaggle token
+            # die at push time, hours in.
+            try:
+                ensure_writable(args.push_tokenizer_to)
+            except RuntimeError as e:
+                p.error(str(e))
+
     if args.selftest:
         from mlm.selftest import selftest
 
@@ -91,6 +134,36 @@ def main(argv=None) -> None:
                             ("save_every", 15), ("val_frac", 0.05)]:
             if getattr(args, name) == p.get_default(name):
                 setattr(args, name, value)
+
+    if args.hub_checkpoints:
+        from mlm.hub import ensure_writable, hf_token
+
+        if args.smoke:
+            # A --smoke run must not touch the network — and with every guard
+            # (ensure_writable, the fresh-run hub check) smoke-disabled, its
+            # final push would atomically REPLACE the repo's real checkpoint
+            # with a 30-step toy one. Refuse the combination outright.
+            p.error("--hub-checkpoints cannot be combined with --smoke: a "
+                    "smoke run must not touch the Hub (its toy checkpoint "
+                    "would replace the repo's real one)")
+        if args.tokenize_to:
+            p.error("--hub-checkpoints does nothing with --tokenize-to; it "
+                    "syncs training checkpoints")
+        if not args.save_dir:
+            p.error("--hub-checkpoints needs --save-dir: checkpoints are "
+                    "saved locally, then pushed")
+        if args.push_every and (not args.save_every
+                                or args.push_every % args.save_every):
+            p.error(f"--push-every {args.push_every} needs --save-every to be "
+                    f"a nonzero divisor of it (got {args.save_every}), or "
+                    f"pushes never line up with a saved checkpoint")
+        if hf_token() is None:
+            p.error("--hub-checkpoints needs a Hugging Face write token: set "
+                    "HF_TOKEN, or run `hf auth login`")
+        try:
+            ensure_writable(args.hub_checkpoints)
+        except RuntimeError as e:
+            p.error(str(e))
 
     if args.tokenize_to:
         from mlm.data import tokenize_to

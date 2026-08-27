@@ -1,0 +1,13 @@
+# jax is deliberately not listed: install the accelerator build that matches
+# the machine (Kaggle GPU/TPU images ship a working one preinstalled):
+#   GPU:  pip install -U "jax[cuda12]"
+#   TPU:  pip install -U "jax[tpu]"
+#   CPU:  pip install -U jax
+flax>=0.12
+optax>=0.2
+orbax-checkpoint>=0.11
+grain>=0.2.12
+array_record
+datasets>=3.0
+tokenizers>=0.20
+tqdm

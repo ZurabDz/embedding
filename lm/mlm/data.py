@@ -9,7 +9,7 @@ from typing import Iterable, Iterator
 import grain
 import numpy as np
 
-from mlm import progress
+from mlm import hub, progress
 from mlm.config import (CLS_ID, MIN_VAL_BATCHES, MIN_WINDOW_TOKENS, N_SPECIAL,
                         PAD_ID, SEP_ID, SPECIAL_TOKENS)
 from mlm.masking import MaskExample
@@ -61,21 +61,65 @@ def download_texts(dataset: str, config: str, n_docs: int, smoke: bool,
     return texts
 
 
-def build_tokenizer(texts: Iterable[str], vocab_size: int, path: str):
-    """Byte-level BPE trained on the target language only."""
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+def _vocab_note(tokenizer, requested: int) -> None:
+    """An authoritative tokenizer (Hub repo or local directory) defines the
+    vocabulary; say so out loud when the flag disagrees instead of silently
+    ignoring it."""
+    n = tokenizer.get_vocab_size()
+    if n != requested:
+        print(f"  note: --vocab-size {requested} is ignored — "
+              f"this tokenizer defines vocab {n}")
 
-    if os.path.exists(path):
-        cached = Tokenizer.from_file(path)
+
+def resolve_tokenizer(spec: str, vocab_size: int):
+    """A ready tokenizer from `spec`, or None when one must be trained.
+
+    `spec` is tried as, in order: a local directory holding a tokenizer.json
+    (e.g. a downloaded Hub repo); an existing local tokenizers-JSON file; an
+    hf://user/repo or bare user/repo Hub id (downloaded, never trained over —
+    a typo'd repo id errors out rather than silently training into a file of
+    that name); anything else returns None and the caller trains a fresh BPE
+    and saves it at `spec`.
+    """
+    from tokenizers import Tokenizer
+
+    if os.path.isdir(spec):
+        inner = os.path.join(spec, "tokenizer.json")
+        if not os.path.isfile(inner):
+            raise RuntimeError(
+                f"--tokenizer-path {spec} is a directory without a "
+                f"tokenizer.json — point at the file itself, or at a Hub repo id"
+            )
+        tok = Tokenizer.from_file(inner)
+        print(f"loaded tokenizer from {inner} (vocab {tok.get_vocab_size()})")
+        _vocab_note(tok, vocab_size)
+        return tok
+    if os.path.isfile(spec):
+        cached = Tokenizer.from_file(spec)
         n = cached.get_vocab_size()
         # A cache smaller than requested is normal — the corpus may not support
         # the full budget. A cache *larger* than requested means --vocab-size was
         # lowered since it was built, and silently reusing it would train a model
         # with a different vocabulary than the flags describe.
         if n <= vocab_size:
-            print(f"reusing tokenizer {path} (vocab {n})")
+            print(f"reusing tokenizer {spec} (vocab {n})")
             return cached
-        print(f"{path} has vocab {n} > requested {vocab_size}; retraining")
+        print(f"{spec} has vocab {n} > requested {vocab_size}; retraining")
+        return None
+    if hub.is_hub_id(spec) and not os.path.isdir(os.path.dirname(spec)):
+        # A bare user/repo whose parent directory exists locally stays a
+        # *training target* (--tokenizer-path tokenizers/kabpe worked before
+        # the Hub integration and still does); hf://user/repo always names the
+        # Hub, since "hf://user" can never be a local directory.
+        tok = hub.load_hub_tokenizer(spec)
+        _vocab_note(tok, vocab_size)
+        return tok
+    return None
+
+
+def train_tokenizer(texts: Iterable[str], vocab_size: int, path: str):
+    """Byte-level BPE trained on the target language only, saved to `path`."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
     n_docs = f" on {len(texts)} documents" if hasattr(texts, "__len__") else ""
     print(f"training a {vocab_size}-token BPE{n_docs} — "
@@ -98,6 +142,25 @@ def build_tokenizer(texts: Iterable[str], vocab_size: int, path: str):
     tok.train_from_iterator(texts, trainer=trainer)
     tok.save(path)
     return tok
+
+
+def push_tokenizer_if_asked(args, vocab_size: int) -> None:
+    """Push the local tokenizer file to the Hub when --push-tokenizer-to is set.
+
+    Runs for freshly trained *and* cache-reused tokenizers (the Hub commit is a
+    no-op when the content is unchanged). A tokenizer that itself came from the
+    Hub has no local file and nothing to push.
+    """
+    if not args.push_tokenizer_to or args.smoke:
+        return
+    if not os.path.exists(args.tokenizer_path):
+        print(f"tokenizer came from the Hub ({args.tokenizer_path}); nothing to push")
+        return
+    hub.push_tokenizer(args.tokenizer_path, args.push_tokenizer_to, details={
+        "vocab size": vocab_size,
+        "corpus": f"{args.dataset} ({args.config})",
+        "trained by": "lm.py --tokenize-to / training run",
+    })
 
 
 class ByteTokenizer:
@@ -290,15 +353,22 @@ def tokenize_to(args, out_dir: str) -> None:
         sample = list(iter_texts(args.dataset, args.config, args.docs, True))
         timings["sample"] = time.time() - t0
     else:
-        n_sample = min(args.tokenizer_docs, args.docs)
-        sample = download_texts(args.dataset, args.config, n_sample, False,
-                                desc="1/3 sample")
-        timings["sample"] = time.time() - t0
+        tokenizer = resolve_tokenizer(args.tokenizer_path, args.vocab_size)
+        if tokenizer is None:
+            n_sample = min(args.tokenizer_docs, args.docs)
+            sample = download_texts(args.dataset, args.config, n_sample, False,
+                                    desc="1/3 sample")
+            timings["sample"] = time.time() - t0
 
-        t0 = time.time()
-        tokenizer = build_tokenizer(sample, args.vocab_size, args.tokenizer_path)
+            t0 = time.time()
+            tokenizer = train_tokenizer(sample, args.vocab_size, args.tokenizer_path)
+            timings["train tokenizer"] = time.time() - t0
+        else:
+            # An already-available tokenizer (local cache or Hub) makes the
+            # sampling pass pointless — pass 2 streams the corpus regardless.
+            sample = []
         vocab_size = tokenizer.get_vocab_size()
-        timings["train tokenizer"] = time.time() - t0
+        push_tokenizer_if_asked(args, vocab_size)
 
     # Pass 2: re-stream, encode in batches, and write rows out as they appear.
     # When the sample already covers the whole corpus there is nothing to
@@ -425,10 +495,19 @@ def load_sources(args):
         return train_source, val_source, True, vocab_size
 
     print("building corpus ...", flush=True)
+    # Resolve the tokenizer *before* the corpus download — same order as
+    # tokenize_to: a typo'd Hub id or a missing/read-only token has to fail in
+    # seconds, not after --docs documents have streamed.
+    tokenizer = (None if args.smoke
+                 else resolve_tokenizer(args.tokenizer_path, args.vocab_size))
     texts = download_texts(args.dataset, args.config, args.docs, args.smoke)
-    tokenizer = (ByteTokenizer() if args.smoke
-                 else build_tokenizer(texts, args.vocab_size, args.tokenizer_path))
-    vocab_size = ByteTokenizer.vocab if args.smoke else tokenizer.get_vocab_size()
+    if args.smoke:
+        tokenizer, vocab_size = ByteTokenizer(), ByteTokenizer.vocab
+    else:
+        if tokenizer is None:
+            tokenizer = train_tokenizer(texts, args.vocab_size, args.tokenizer_path)
+        vocab_size = tokenizer.get_vocab_size()
+        push_tokenizer_if_asked(args, vocab_size)
 
     n_texts = len(texts)
     pb = bar(total=n_texts, desc="encode", unit="doc")

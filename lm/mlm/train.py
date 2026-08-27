@@ -10,6 +10,7 @@ import numpy as np
 from flax import nnx
 
 from mlm import checkpoint as ckpt
+from mlm import hub
 from mlm import progress
 from mlm.config import N_SPECIAL, PAD_ID, EncoderConfig
 from mlm.data import decode_record, load_sources, make_dataset
@@ -67,6 +68,11 @@ def train(args) -> None:
     if args.resume:
         if not args.save_dir:
             raise RuntimeError("--resume needs a --save-dir to resume from")
+        if args.hub_checkpoints and not args.smoke:
+            # A fresh session pulls the repo's checkpoint; a local dir that is
+            # already ahead (or tied) is left alone. (cli already vetoes the
+            # --smoke combination; the guard here is defense in depth.)
+            hub.pull_checkpoint(args.save_dir, args.hub_checkpoints)
         model, optimizer, cfg, start_step = ckpt.resume_checkpoint(args.save_dir, schedule)
         if cfg.vocab_size != vocab_size:
             raise RuntimeError(
@@ -82,6 +88,17 @@ def train(args) -> None:
     else:
         if args.save_dir:
             ckpt.assert_writable(args.save_dir)
+            if args.hub_checkpoints and not args.smoke:
+                # the Hub-side twin of assert_writable: a fresh run would push
+                # step 500 over a repo already holding a later checkpoint
+                hub_step = hub.hub_latest_step(args.hub_checkpoints)
+                if hub_step is not None:
+                    raise RuntimeError(
+                        f"hf.co/{hub.strip_prefix(args.hub_checkpoints)} already "
+                        f"holds a checkpoint at step {hub_step}. Pass --resume to "
+                        f"continue it (it is pulled automatically), or push to a "
+                        f"different repo."
+                    )
         cfg = EncoderConfig(
             vocab_size=vocab_size,
             hidden=args.hidden,
@@ -136,6 +153,7 @@ def train(args) -> None:
 
     start = time.time()
     timed_from = start_step
+    last_pushed = None
     pb = bar(total=args.steps, desc="train", unit="step", initial=start_step)
     for step in range(start_step + 1, args.steps + 1):
         batch = next(data_iter)
@@ -179,6 +197,17 @@ def train(args) -> None:
             pb.write(f"step {step:>6}  held-out loss {val:6.3f}  (train {float(loss):6.3f})")
         if mgr is not None and args.save_every and step % args.save_every == 0:
             ckpt.save_checkpoint(mgr, step, model, optimizer, data_iter)
+            if (args.hub_checkpoints and not args.smoke and args.push_every
+                    and step % args.push_every == 0):
+                # orbax saves asynchronously; only complete files may upload
+                mgr.wait_until_finished()
+                try:
+                    hub.push_checkpoint(args.save_dir, step, args.hub_checkpoints)
+                    last_pushed = step
+                except Exception as e:
+                    # a Hub hiccup must not kill an hours-long run; the local
+                    # checkpoint exists and the next push retries naturally
+                    pb.write(f"WARNING: checkpoint push failed at step {step}: {e}")
 
     pb.close()
     model.eval()
@@ -190,6 +219,10 @@ def train(args) -> None:
         mgr.wait_until_finished()
         print(f"checkpoints in {os.path.abspath(args.save_dir)}: steps {mgr.all_steps()}")
         mgr.close()
+        if args.hub_checkpoints and not args.smoke and last_pushed != args.steps:
+            # the final push raises on failure: training is already saved
+            # locally, and a silent miss here would read as "it's on the Hub"
+            hub.push_checkpoint(args.save_dir, args.steps, args.hub_checkpoints)
 
     # embeddings for downstream use: mean-pool the hidden states over content
     # tokens only. `>= N_SPECIAL` drops [PAD], [CLS], [SEP] and [MASK] at once —

@@ -43,12 +43,70 @@ python lm.py --tokenize-to data/ka --docs 2000000
 python lm.py --data-dir data/ka --steps 100000
 ```
 
+### Tokenizer on the Hugging Face Hub
+
+With a write token in the `HF_TOKEN` env var, a freshly trained (or
+cache-reused) tokenizer can be pushed to the Hub — the repo is created
+*private* on first push:
+
+```bash
+HF_TOKEN=hf_... python lm.py --tokenize-to data/ka --docs 2000000     --push-tokenizer-to <user>/ka-bpe-32k
+```
+
+`--tokenizer-path` then accepts a Hub id anywhere a local path works, so a
+later session (or the fine-tuning stage) pulls the exact same vocabulary
+without carrying the JSON around:
+
+```bash
+python lm.py --steps 20000 --docs 200000 --tokenizer-path <user>/ka-bpe-32k
+# or explicitly: --tokenizer-path hf://<user>/ka-bpe-32k
+```
+
+Rules: an existing local file is reused when its vocab fits within
+`--vocab-size` (and retrained in place when it exceeds it); a local directory
+uses the `tokenizer.json` inside (e.g. a downloaded Hub repo); an
+`hf://user/repo` or bare `user/repo` id downloads `tokenizer.json` from the
+Hub (a typo'd id errors out — it is never silently retrained), except that a
+bare id whose parent directory exists locally is treated as a path; any other
+value trains a fresh BPE and saves it there. A tokenizer from the Hub or a
+directory defines the vocabulary — `--vocab-size` is ignored, with a printed
+note. Private repos need a token for loading too (`HF_TOKEN` or
+`hf auth login`).
+
 Interrupted runs continue with their Adam moments *and* their exact position in
 the data stream, so a resumed run matches an uninterrupted one:
 
 ```bash
 python lm.py --data-dir data/ka --steps 100000 --resume
 ```
+
+### Checkpoints on the Hugging Face Hub
+
+`--hub-checkpoints user/repo` syncs checkpoints with a (private) Hub repo in
+both directions: pushed checkpoints atomically replace the repo's previous one
+(the repo always holds exactly the newest, as `<step>/` + `config.json`,
+mirroring `--save-dir`), and `--resume` pulls it back whenever it is newer
+than anything local. The *same command* therefore chains across capped
+sessions:
+
+```bash
+# every session, identical command (add --resume from the second one on):
+HF_TOKEN=hf_... python lm.py --data-dir data/ka --steps 100000     --hub-checkpoints <user>/ka-mlm --push-every 2500 --resume
+```
+
+`--push-every 0` (the default) pushes only the final checkpoint; N > 0 (a
+nonzero multiple of `--save-every`) also pushes mid-run so a killed session
+loses at most N steps. Each push blocks training while it uploads (~a few
+hundred MB), so pick N accordingly. A mid-run push failure only warns; the
+final push fails loudly. Local `--keep` history is unaffected — the Hub holds
+one checkpoint, the local dir keeps ten for forking off the LR plateau.
+
+Hub storage note: deleting the old step only removes it from the repo *tree*;
+the blobs would keep counting against your account quota (100 GB free tier)
+— so after every push the repo history is squashed automatically, keeping
+storage at ~one checkpoint. If the squash ever fails it warns and retries on
+the next push. `--smoke` refuses `--hub-checkpoints` outright: a smoke run
+never touches the Hub.
 
 `--steps` is the *total* schedule length (it defines the LR trapezoid), not
 "how many more steps" — keep it the same when resuming an unfinished run.
@@ -85,23 +143,34 @@ divisible by 8:
     --batch-size 256 --dtype bfloat16 --save-dir /kaggle/working/checkpoints
 ```
 
-**Workflow across the ~9–12 h session cap:**
+**Workflow across the ~9–12 h session cap.** Kaggle secrets are *not* env
+vars — export the token in a notebook cell first, so `!python` subprocesses
+inherit it (attach it via Add-ons → Secrets):
 
-1. One CPU session: `!python lm.py --tokenize-to /kaggle/working/data_ka --docs 2000000`,
-   then save the notebook output as a Kaggle dataset (this also produces
-   `ka_bpe.json` — keep it, fine-tuning needs the same tokenizer).
-2. Each training session: attach the tokenized dataset plus the *previous*
-   session's checkpoint output, copy the checkpoints somewhere writable, and
-   resume:
+```python
+import os
+from kaggle_secrets import UserSecretsClient
+os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+```
+
+(Colab equivalent: `from google.colab import userdata;
+os.environ["HF_TOKEN"] = userdata.get("HF_TOKEN")`.) Then:
+
+1. One CPU session: `!python lm.py --tokenize-to /kaggle/working/data_ka
+   --docs 2000000 --push-tokenizer-to <user>/ka-bpe-32k`, then save the
+   notebook output as a Kaggle dataset.
+2. Every training session runs the *same* command — checkpoints round-trip
+   through the Hub, so nothing is copied between sessions by hand:
 
    ```
-   !cp -r /kaggle/input/<prev-run>/checkpoints /kaggle/working/checkpoints
    !python lm.py --data-dir /kaggle/input/<tokenized-ds> --steps 100000 \
        --batch-size 256 --dtype bfloat16 \
-       --save-dir /kaggle/working/checkpoints --resume
+       --save-dir /kaggle/working/checkpoints \
+       --hub-checkpoints <user>/ka-mlm --push-every 2500 --resume
    ```
 
-3. Save `/kaggle/working/checkpoints` as the session's output; repeat.
+   (Drop `--resume` only for the very first session; every later one pulls
+   the newest checkpoint from the Hub automatically.)
 
 ## Progress reporting
 

@@ -16,14 +16,16 @@ matrix**: for any batch of sentences, we want
 cos(student_i, student_j)  ≈  cos(teacher_i, teacher_j)   for all i, j
 ```
 
-This is *dimension-agnostic* — the student can output 128-dim vectors while the
-teacher outputs 3072-dim — and it's exactly what you care about for retrieval,
-clustering, and semantic search. Two loss options are provided:
+The *default* objective is per-example cosine regression: the student outputs
+in the teacher's full space (`out_dim == teacher_dim`) and each embedding is
+pulled onto its own mean-centered teacher vector — a full-information target
+per example. The similarity-matrix matching above can be layered on as an
+auxiliary loss via `--sim_weight`:
 
-- **`mse`** — mean-squared error between the two similarity matrices. Simple, stable.
-- **`kl`** — treat each row's similarities (softmax with a temperature) as a
-  *retrieval distribution* and minimize cross-entropy. Preserves nearest-neighbour
-  ranking better; good when you mainly care about "which items are closest".
+- **`--sim_loss mse`** — mean-squared error between the two similarity matrices.
+- **`--sim_loss kl`** — treat each row's similarities (softmax with a temperature)
+  as a *retrieval distribution* and minimize cross-entropy. Preserves
+  nearest-neighbour ranking better.
 
 Because the teacher embeddings are **cached once**, training is fast, fully offline,
 and costs no further API calls.
@@ -83,10 +85,28 @@ large corpus can be embedded across several days. Daily usage is tracked in
 
 **4. Distill**:
 ```bash
-python train.py --epochs 30 --batch_size 128 --loss mse
-# ranking-focused variant:
-python train.py --epochs 30 --batch_size 128 --loss kl --temperature 0.05
+python train.py --epochs 30 --batch_size 128
+# add the similarity-matching auxiliary term:
+python train.py --epochs 30 --batch_size 128 --sim_weight 0.5 --sim_loss kl --temperature 0.05
 ```
+
+**4b. Distill from the pretrained MLM encoder (recommended).** Instead of the
+tiny from-scratch student, start from the Georgian MLM encoder pretrained by
+the sibling `../lm` project and fine-tune the whole thing — it already knows
+the language, so distillation only has to shape the embedding space:
+
+```bash
+python train.py --mlm_checkpoint ZurabDz/ka-mlm --tokenizer ZurabDz/ka-bpe-32k     --epochs 10 --batch_size 128 --dropout 0.1
+```
+
+`--mlm_checkpoint` takes the Hub repo pushed by lm's `--hub-checkpoints` (or a
+local lm `--save-dir`); `--tokenizer` must be the tokenizer that encoder was
+pretrained with — it's checked. Private repos need `HF_TOKEN`. Skip
+`train_tokenizer.py` in this flow; steps 1 (data) and 3 (teacher cache) are
+unchanged. The from-scratch sizing flags (`--dim/--depth/...`) are ignored, the
+default LR drops to 5e-5 (fine-tuning), and this student is ~34M params rather
+than ~1M — no longer tiny, but far stronger. eval.py works on either kind
+unchanged.
 
 **5. Evaluate + try retrieval**:
 ```bash
@@ -106,9 +126,6 @@ python train.py --epochs 40 --batch_size 16 --warmup 40
 python eval.py --query "ქართული ღვინო და სუფრა"
 ```
 
-`python sanity_test.py` overfits a single batch to confirm the model + gradients
-are wired correctly.
-
 ## Reading the metrics
 
 `eval.py` reports agreement between student and teacher on **held-out** sentences:
@@ -125,8 +142,10 @@ are wired correctly.
   much better. Distillation quality is mostly bounded by how much (diverse) text
   the teacher gets to label. If val Spearman rises then falls while train loss
   keeps dropping, you're overfitting → get more data or add `--dropout 0.1`.
-- **Student size.** Start `--dim 256 --depth 4 --heads 4 --out_dim 256`. Shrink
-  for a faster/smaller model, grow if you're underfitting a large corpus.
+- **Student size.** Start `--dim 256 --depth 4 --heads 4`. Shrink for a
+  faster/smaller model, grow if you're underfitting a large corpus. Omit
+  `--out_dim`: cosine regression requires it to equal the teacher dim, and the
+  default resolves to that automatically.
 - **Batch size matters for this loss.** Similarities are computed *within* each
   batch, so larger batches give a richer target matrix — use the biggest that fits.
 - **`input_type`.** Embed the whole corpus with one consistent type (`passage`).
@@ -146,4 +165,4 @@ are wired correctly.
 | `train.py` | the distillation training loop |
 | `eval.py` | correlation with teacher + nearest-neighbour retrieval demo |
 | `make_synthetic_teacher.py` | offline stand-in for the teacher (no API key) |
-| `sanity_test.py` | single-batch overfit check |
+| `mlm_student.py` | student built on the pretrained MLM encoder from `../lm` |

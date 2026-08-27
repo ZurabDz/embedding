@@ -5,6 +5,7 @@ Imported by train.py and eval.py so the two stay perfectly consistent.
 from __future__ import annotations
 
 import hashlib
+import os
 
 import numpy as np
 import jax
@@ -15,8 +16,21 @@ from tokenizers import Tokenizer
 # --------------------------------------------------------------------------- #
 # Tokenization
 # --------------------------------------------------------------------------- #
-def load_tokenizer(path: str) -> Tokenizer:
-    return Tokenizer.from_file(path)
+def load_tokenizer(spec: str) -> Tokenizer:
+    """A tokenizers-JSON file path, or a Hub repo id (e.g. ZurabDz/ka-bpe-32k)
+    whose tokenizer.json is downloaded — private repos need HF_TOKEN."""
+    if os.path.isfile(spec):
+        return Tokenizer.from_file(spec)
+    if "/" in spec and not spec.endswith(".json"):
+        from huggingface_hub import hf_hub_download
+
+        repo = spec.removeprefix("hf://")
+        local = hf_hub_download(repo_id=repo, filename="tokenizer.json",
+                                token=os.environ.get("HF_TOKEN"))
+        tok = Tokenizer.from_file(local)
+        print(f"loaded tokenizer from hf.co/{repo} (vocab {tok.get_vocab_size()})")
+        return tok
+    raise FileNotFoundError(f"tokenizer not found: {spec}")
 
 
 def encode_batch(tokenizer: Tokenizer, sentences, max_len: int, pad_id: int = 0):

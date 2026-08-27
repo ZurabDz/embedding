@@ -21,11 +21,16 @@ from distill_lib import load_tokenizer, encode_batch, similarity_agreement, val_
 def load_student(config_path, params_path):
     with open(config_path) as f:
         cfg = json.load(f)
-    model = EmbeddingModel(
-        vocab_size=cfg["vocab_size"], dim=cfg["dim"], depth=cfg["depth"],
-        heads=cfg["heads"], mlp_dim=cfg["mlp_dim"], out_dim=cfg["out_dim"],
-        max_len=cfg["max_len"], dropout=0.0, embed_dim=cfg.get("embed_dim"),
-        rngs=nnx.Rngs(0))
+    if cfg.get("student_type") == "mlm":
+        from mlm_student import build_mlm_student_from_config
+
+        model = build_mlm_student_from_config(cfg)
+    else:
+        model = EmbeddingModel(
+            vocab_size=cfg["vocab_size"], dim=cfg["dim"], depth=cfg["depth"],
+            heads=cfg["heads"], mlp_dim=cfg["mlp_dim"], out_dim=cfg["out_dim"],
+            max_len=cfg["max_len"], dropout=0.0, embed_dim=cfg.get("embed_dim"),
+            rngs=nnx.Rngs(0))
     state = nnx.state(model, nnx.Param)  # template with the right structure/shapes
     with open(params_path, "rb") as f:
         pure = serialization.from_bytes(nnx.to_pure_dict(state), f.read())
@@ -34,8 +39,8 @@ def load_student(config_path, params_path):
     return model, cfg
 
 
-def embed(model, tok, texts, max_len, batch=256):
-    tokens, mask = encode_batch(tok, texts, max_len)
+def embed(model, tok, texts, max_len, batch=256, encode=encode_batch):
+    tokens, mask = encode(tok, texts, max_len)
     outs = []
     for i in range(0, len(texts), batch):
         e = model(jnp.asarray(tokens[i : i + batch]),
@@ -58,6 +63,10 @@ def main():
 
     model, cfg = load_student(args.config, args.params)
     tok = load_tokenizer(cfg["tokenizer"])
+    if cfg.get("student_type") == "mlm":
+        from mlm_student import encode_batch_mlm as _encode
+    else:
+        _encode = encode_batch
 
     with open(args.sentences, encoding="utf-8") as f:
         sentences = json.load(f)
@@ -68,7 +77,7 @@ def main():
 
     va_sents = [sentences[i] for i in val_idx]
     va_teacher = teacher[val_idx]
-    va_student = embed(model, tok, va_sents, cfg["max_len"])
+    va_student = embed(model, tok, va_sents, cfg["max_len"], encode=_encode)
 
     m = similarity_agreement(va_student, va_teacher)
     print("Held-out agreement with teacher:")
@@ -77,8 +86,8 @@ def main():
     print(f"  top-1 NN agreement    : {m['top1_nn_agreement']:.3f}")
 
     if args.query:
-        corpus_emb = embed(model, tok, sentences, cfg["max_len"])
-        q = embed(model, tok, [args.query], cfg["max_len"])[0]
+        corpus_emb = embed(model, tok, sentences, cfg["max_len"], encode=_encode)
+        q = embed(model, tok, [args.query], cfg["max_len"], encode=_encode)[0]
         corpus_emb /= (np.linalg.norm(corpus_emb, axis=-1, keepdims=True) + 1e-12)
         q /= (np.linalg.norm(q) + 1e-12)
         scores = corpus_emb @ q

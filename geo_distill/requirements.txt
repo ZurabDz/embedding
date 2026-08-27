@@ -8,5 +8,10 @@ numpy
 tokenizers>=0.15
 datasets>=2.14      # only needed by data.py
 
+# Pretrained MLM student (--mlm_checkpoint): load ../lm checkpoints from the Hub
+huggingface_hub>=0.20
+orbax-checkpoint>=0.11
+
 # Teacher endpoint client
 google-genai>=1.0   # only needed by embed_teacher.py (Gemini embeddings)
+python-dotenv>=1.0  # only needed by embed_teacher.py (.dotenv key loading)

@@ -37,6 +37,7 @@ import functools
 import json
 import math
 import os
+import sys
 import time
 from typing import Iterable, Iterator
 
@@ -763,13 +764,101 @@ def _draining(texts):
         i += 1
 
 
-def bar(total=None, desc: str = "", unit: str = "it", initial: int = 0):
-    """A tqdm if progress is on and tqdm is importable, otherwise a silent stub.
+def _hms(seconds: float) -> str:
+    s = int(max(seconds, 0))
+    return f"{s // 3600:d}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 \
+        else f"{s // 60:d}:{s % 60:02d}"
 
-    Everything that draws progress goes through here so the whole feature is one
-    import away from being off, and --no-progress leaves the old plain output.
+
+class _LineProgress:
+    """Newline-delimited progress, for when stderr is not a terminal.
+
+    tqdm redraws in place with carriage returns. A terminal collapses those onto
+    one line, but Colab's `!command` renderer, log files, nohup and CI do not —
+    they concatenate every redraw into a single enormously wide line that scrolls
+    off screen, which reads as "there is no progress bar". One plain line every
+    few seconds is legible everywhere and greppable afterwards.
     """
-    if PROGRESS:
+
+    def __init__(self, total, desc, unit, initial=0, every=10.0):
+        self.total, self.desc, self.unit = total, desc, unit
+        self.n = initial
+        self.start = self.last = time.time()
+        self.every = every
+        self.postfix = ""
+        self.shown = -1  # count at the last emit, so close() can skip a repeat
+
+    def update(self, k=1):
+        self.n += k
+        now = time.time()
+        if now - self.last >= self.every:
+            self._emit(now)
+
+    def set_postfix(self, **kw):
+        self.postfix = "  " + "  ".join(f"{k} {v}" for k, v in kw.items())
+        self._emit(time.time())  # fresh numbers just arrived; show them now
+
+    def _emit(self, now, final=False):
+        self.last, self.shown = now, self.n
+        elapsed = now - self.start
+        rate = self.n / elapsed if elapsed > 0 else 0.0
+        head = f"{self.desc:<12}" if self.desc else ""
+        if self.total:
+            eta = "" if final or rate <= 0 else f"  eta {_hms((self.total - self.n) / rate)}"
+            body = (f"{100.0 * self.n / self.total:5.1f}%  {self.n}/{self.total} {self.unit}"
+                    f"  {rate:.0f} {self.unit}/s  {_hms(elapsed)}{eta}")
+        else:
+            body = f"{self.n} {self.unit}  {rate:.0f} {self.unit}/s  {_hms(elapsed)}"
+        print(head + body + self.postfix, file=sys.stderr, flush=True)
+
+    def write(self, s):
+        print(s, flush=True)
+
+    def close(self):
+        if self.n != self.shown:
+            self._emit(time.time(), final=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+class _Stub:
+    """--no-progress: count silently, pass messages straight through."""
+
+    n = 0
+
+    def update(self, k=1):
+        self.n += k
+
+    def set_postfix(self, **kw):
+        pass
+
+    def write(self, s):
+        print(s, flush=True)
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        pass
+
+
+def bar(total=None, desc: str = "", unit: str = "it", initial: int = 0):
+    """Progress reporter appropriate to where the output is going.
+
+    A real tqdm on a terminal; plain periodic lines when stderr is redirected —
+    which is the Colab `!python ...` case, where tqdm's carriage returns render
+    as one unreadable line kilometres wide.
+    """
+    if not PROGRESS:
+        return _Stub()
+    if sys.stderr.isatty():
         try:
             from tqdm.auto import tqdm
 
@@ -777,29 +866,7 @@ def bar(total=None, desc: str = "", unit: str = "it", initial: int = 0):
                         dynamic_ncols=True, smoothing=0.05)
         except ImportError:
             pass
-
-    class _Stub:
-        n = 0
-
-        def update(self, k=1):
-            self.n += k
-
-        def set_postfix(self, **kw):
-            pass
-
-        def write(self, s):
-            print(s, flush=True)
-
-        def close(self):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            pass
-
-    return _Stub()
+    return _LineProgress(total, desc, unit, initial)
 
 
 def _encoded(texts, tokenizer, consume: bool = False, batch_size: int = 1000,
@@ -1325,6 +1392,13 @@ def main():
 
     global PROGRESS
     PROGRESS = args.progress
+    # Piped stdout is block-buffered by default, so plain prints would surface
+    # long after the progress lines they belong between. Colab captures both
+    # streams into one cell, which makes the reordering very visible.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
 
     print(f"smoke test: {args.smoke} ...")
 

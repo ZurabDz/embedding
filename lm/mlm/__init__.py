@@ -8,7 +8,7 @@ Quick start, no network needed:
     python lm.py --smoke
 
 Real run on Georgian FineWeb-2:
-    pip install datasets tokenizers
+    pip install -e .          # the ka-mlm package (or `uv sync` at the repo root)
     python lm.py --steps 20000 --docs 200000
 
 Corpora too large to hold in host RAM are tokenised once, up front, and then

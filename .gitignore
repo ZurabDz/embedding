@@ -13,4 +13,15 @@ wheels/
 .dotenv
 .env
 .env.*
-lm/checkpoints/*
+
+# Pipeline outputs (the committed sample corpus lives in tests/data/)
+artifacts/
+checkpoints/
+data/
+!tests/data/
+!tests/data/**
+
+# Notebook scratch
+.ipynb_checkpoints/
+test.ipynb
+lm/lm_working.ipynb

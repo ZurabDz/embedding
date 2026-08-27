@@ -3,7 +3,6 @@ grain input pipeline — everything between raw text and a masked batch."""
 
 import json
 import os
-import sys
 import time
 from typing import Iterable, Iterator
 
@@ -94,7 +93,7 @@ def build_tokenizer(texts: Iterable[str], vocab_size: int, path: str):
         # The Rust bar redraws with carriage returns, which only a real terminal
         # renders; piped or notebook-captured output would get one line
         # kilometres wide.
-        show_progress=progress.PROGRESS and sys.stderr.isatty(),
+        show_progress=progress.raw_terminal(),
     )
     tok.train_from_iterator(texts, trainer=trainer)
     tok.save(path)

@@ -110,9 +110,14 @@ reports progress, adapted to where the output lands:
 
 - a real terminal: tqdm, redrawn in place;
 - a Jupyter/Colab/Kaggle notebook kernel: tqdm's live notebook widget;
-- `!python ...` cells, log files, nohup, CI: one plain line every ~10 s
-  (tqdm's carriage-return redraws would render as a single unreadable line
-  there), greppable afterwards.
+- `!python ...` cells, log files, nohup, CI: one plain line every ~10 s,
+  greppable afterwards. Colab's `!` cells pretend to be a terminal (a pty)
+  but cannot render tqdm's carriage-return redraws — they are detected via
+  the COLAB_*/KAGGLE_* env vars and get plain lines too.
+
+The first training step jit-compiles the whole graph (minutes on a GPU); a
+notice says so, step 1 reports its own duration, and every rate/ETA after it
+excludes the compile.
 
 `--no-progress` switches to plain periodic prints everywhere.
 

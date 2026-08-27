@@ -16,7 +16,7 @@ from mlm.data import decode_record, load_sources, make_dataset
 from mlm.masking import n_predictions
 from mlm.model import MlmEncoder, mlm_loss, count_params
 from mlm.optim import make_optimizer, trapezoid_schedule
-from mlm.progress import bar
+from mlm.progress import bar, restart_timer
 from mlm.sharding import device_stream, make_shardings, replicate, to_device
 
 
@@ -129,19 +129,34 @@ def train(args) -> None:
     tokens_per_step = args.batch_size * args.seq_len
     print(f"training steps {start_step + 1}..{args.steps} at {args.mask_prob:.0%} masking, "
           f"{tokens_per_step} tokens/step")
+    # The first step jit-compiles the whole graph — minutes of silence on a GPU
+    # if nothing says so. Progress lines start once step 1 is actually done.
+    print("compiling the train step — the first step takes a minute or two ...",
+          flush=True)
 
     start = time.time()
+    timed_from = start_step
     pb = bar(total=args.steps, desc="train", unit="step", initial=start_step)
     for step in range(start_step + 1, args.steps + 1):
         batch = next(data_iter)
         loss = train_step(model, optimizer, batch)
         pb.update(1)
-        if step % args.log_every == 0 or step == start_step + 1:
+        if step == start_step + 1:
+            # Step 1 is where jit compiles the whole graph. Block on it, report
+            # it, then restart every clock: folded into the run average, a
+            # 90-second compile would understate tok/s by 100x at step 1 and
+            # still ~40% at step 500, with the ETA wrong the same way.
+            pb.write(f"step {step:>6}  loss {float(loss):6.3f}  "
+                     f"(first step took {time.time() - start:.0f}s, jit compile included)")
+            start = time.time()
+            timed_from = step
+            restart_timer(pb)
+        elif step % args.log_every == 0:
             # float(loss) is a device sync, so it stays on the log cadence
             # rather than happening every step just to feed the bar.
             loss = float(loss)
             elapsed = time.time() - start
-            done = step - start_step  # this run's steps, not the schedule's
+            done = step - timed_from  # steps inside the timed window
             rate = done * tokens_per_step / max(elapsed, 1e-6) / 1e3
             lr = float(schedule(step - 1))
             if progress.PROGRESS:

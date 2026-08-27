@@ -8,6 +8,7 @@ Three environments, three behaviours:
     newline-delimited lines every few seconds, greppable afterwards.
 """
 
+import os
 import sys
 import time
 
@@ -30,7 +31,27 @@ def _in_notebook() -> bool:
     except ImportError:
         return False
     shell = get_ipython()
-    return shell is not None and type(shell).__name__ == "ZMQInteractiveShell"
+    if shell is None:
+        return False
+    # Colab's shell subclasses ZMQInteractiveShell under another name ("Shell"),
+    # so walk the MRO rather than matching the leaf class name.
+    return any(c.__name__ == "ZMQInteractiveShell" for c in type(shell).__mro__)
+
+
+def _hosted_notebook_env() -> bool:
+    """Colab or Kaggle, *including* their `!python ...` subshells.
+
+    Colab runs `!` commands through a pty, so isatty() is True and the terminal
+    branch would pick tqdm — but the cell renderer does not collapse tqdm's
+    carriage-return redraws; they accumulate into one enormously wide line
+    that scrolls off screen and reads as "there is no progress bar at all".
+    These env vars are inherited by the subprocess, where plain periodic lines
+    are legible in both frontends.
+    """
+    return any(k in os.environ for k in (
+        "COLAB_RELEASE_TAG", "COLAB_BACKEND_VERSION",   # Colab
+        "KAGGLE_KERNEL_RUN_TYPE", "KAGGLE_URL_BASE",    # Kaggle
+    ))
 
 
 def _hms(seconds: float) -> str:
@@ -51,7 +72,7 @@ class _LineProgress:
 
     def __init__(self, total, desc, unit, initial=0, every=10.0):
         self.total, self.desc, self.unit = total, desc, unit
-        self.n = initial
+        self.n = self.initial = initial
         self.start = self.last = time.time()
         self.every = every
         self.postfix = ""
@@ -70,7 +91,10 @@ class _LineProgress:
     def _emit(self, now, final=False):
         self.last, self.shown = now, self.n
         elapsed = now - self.start
-        rate = self.n / elapsed if elapsed > 0 else 0.0
+        # rate over *this run's* work only: on --resume, n starts at initial,
+        # and counting that pre-done work would inflate the rate and shrink the
+        # ETA by however far the previous session got.
+        rate = (self.n - self.initial) / elapsed if elapsed > 0 else 0.0
         head = f"{self.desc:<12}" if self.desc else ""
         if self.total:
             eta = "" if final or rate <= 0 else f"  eta {_hms((self.total - self.n) / rate)}"
@@ -118,11 +142,41 @@ class _Stub:
         pass
 
 
+def restart_timer(pb) -> None:
+    """Re-stamp a reporter's clock to *now* — called once jit compilation is
+    done, so every later rate and ETA describes steady-state training instead
+    of amortising the first step's multi-minute compile across the whole run."""
+    now = time.time()
+    if isinstance(pb, _LineProgress):
+        pb.start = pb.last = now
+        pb.initial = pb.n
+    elif hasattr(pb, "start_t"):  # tqdm
+        pb.initial = pb.n
+        pb.start_t = now
+        pb.last_print_t = now
+    # _Stub keeps no clock
+
+
+def raw_terminal() -> bool:
+    """True when stderr is a real terminal that renders carriage-return redraws.
+
+    Gates third-party CR-based bars (e.g. the tokenizers Rust trainer's), which
+    bar() cannot wrap: Colab's pty-backed `!` cells claim to be a tty but
+    accumulate the redraws into one unreadable line.
+    """
+    return PROGRESS and sys.stderr.isatty() and not _hosted_notebook_env()
+
+
 def bar(total=None, desc: str = "", unit: str = "it", initial: int = 0):
-    """Progress reporter appropriate to where the output is going."""
+    """Progress reporter appropriate to where the output is going.
+
+    Precedence: a live kernel gets tqdm's notebook widget; a real terminal
+    gets tqdm — unless it is Colab/Kaggle's pty-backed `!` cell, whose fake
+    tty cannot render redraws; everything else gets periodic plain lines.
+    """
     if not PROGRESS:
         return _Stub()
-    if sys.stderr.isatty() or _in_notebook():
+    if _in_notebook() or (sys.stderr.isatty() and not _hosted_notebook_env()):
         try:
             from tqdm.auto import tqdm
 

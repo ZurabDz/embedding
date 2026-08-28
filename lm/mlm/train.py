@@ -12,8 +12,8 @@ from flax import nnx
 from mlm import checkpoint as ckpt
 from mlm import hub
 from mlm import progress
-from mlm.config import N_SPECIAL, PAD_ID, EncoderConfig
-from mlm.data import decode_record, load_sources, make_dataset
+from mlm.config import PAD_ID, EncoderConfig
+from mlm.encoding import pool_content
 from mlm.masking import n_predictions
 from mlm.model import MlmEncoder, mlm_loss, count_params
 from mlm.optim import make_optimizer, trapezoid_schedule
@@ -58,6 +58,11 @@ def evaluate(model, val_ds, max_batches: int = 32):
 
 
 def train(args) -> None:
+    # Imported here, not at module top: mlm.data pulls in grain, and keeping it
+    # out of the module scope is what lets --selftest (which imports train_step)
+    # run on a lean install without the input pipeline.
+    from mlm.data import decode_record, load_sources, make_dataset
+
     train_source, val_source, decode, vocab_size = load_sources(args)
 
     # Built before the model because resuming has to rebuild the optimizer with
@@ -224,12 +229,10 @@ def train(args) -> None:
             # locally, and a silent miss here would read as "it's on the Hub"
             hub.push_checkpoint(args.save_dir, args.steps, args.hub_checkpoints)
 
-    # embeddings for downstream use: mean-pool the hidden states over content
-    # tokens only. `>= N_SPECIAL` drops [PAD], [CLS], [SEP] and [MASK] at once —
-    # [CLS] in particular is an untrained attention sink here, so averaging it in
-    # would fold a high-norm outlier into every embedding. Fed clean windows,
-    # not masked ones: corrupting the input is a training device, not a step you
-    # want between raw text and its vector.
+    # embeddings for downstream use: pool_content mean-pools the hidden states
+    # over content tokens only (mlm/encoding.py explains why [CLS] is dropped).
+    # Fed clean windows, not masked ones: corrupting the input is a training
+    # device, not a step you want between raw text and its vector.
     #
     # This is a smoke check that the encode path works, not evidence that the
     # vectors are good. MLM puts no loss on the aggregate of a sequence, so the
@@ -240,6 +243,5 @@ def train(args) -> None:
                      for i in range(args.batch_size)])
     batch = to_device({"ids": rows, "am": (rows != PAD_ID).astype(np.int32)}, data_sharding)
     hidden = nnx.jit(lambda m, i, a: m.encode(i, a))(model, batch["ids"], batch["am"])
-    w = (batch["ids"] >= N_SPECIAL)[..., None].astype(hidden.dtype)
-    pooled = (hidden * w).sum(1) / jnp.maximum(w.sum(1), 1.0)
+    pooled = pool_content(hidden, batch["ids"])
     print(f"pooled embedding shape {pooled.shape}")

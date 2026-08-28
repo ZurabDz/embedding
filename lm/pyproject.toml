@@ -1,0 +1,32 @@
+[project]
+name = "ka-mlm"
+version = "0.1.0"
+description = "Small bidirectional Georgian MLM encoder pretraining in Flax NNX (the `mlm` package)"
+requires-python = ">=3.12"
+# jax itself is deliberately not pinned here beyond what flax pulls in: on
+# GPU/TPU hosts (Kaggle, Colab) the accelerator-matched jax wheel is already
+# installed and must not be replaced by a CPU build — a floor that resolves to
+# the preinstalled version is all we want. Locally, flax's own dependency
+# brings in CPU jax.
+dependencies = [
+    "flax>=0.12",
+    "optax>=0.2",
+    "numpy",
+    "orbax-checkpoint>=0.11",
+    "grain>=0.2.12",
+    "array-record",
+    "datasets>=3.0",
+    "tokenizers>=0.20",
+    "tqdm",
+    "huggingface-hub>=0.20",
+]
+
+[project.scripts]
+mlm = "mlm.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mlm"]

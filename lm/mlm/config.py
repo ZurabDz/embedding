@@ -43,3 +43,21 @@ class EncoderConfig:
     def head_dim(self) -> int:
         assert self.hidden % self.heads == 0
         return self.hidden // self.heads
+
+    def to_json_dict(self) -> dict:
+        """JSON-safe dict: dtypes stored by name, so config.json stays readable
+        and round-trips through getattr(jnp, name)."""
+        d = dataclasses.asdict(self)
+        for k in ("dtype", "param_dtype"):
+            d[k] = getattr(self, k).__name__
+        return d
+
+    @classmethod
+    def from_json_dict(cls, d: dict) -> "EncoderConfig":
+        # param_dtype is absent from configs written before it was split out;
+        # the dataclass default (fp32) is the right answer for those.
+        d = dict(d)
+        for k in ("dtype", "param_dtype"):
+            if k in d:
+                d[k] = getattr(jnp, d[k])
+        return cls(**d)

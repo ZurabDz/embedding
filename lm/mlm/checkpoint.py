@@ -4,8 +4,6 @@ import dataclasses
 import json
 import os
 
-import grain
-import jax.numpy as jnp
 from flax import nnx
 
 from mlm.config import EncoderConfig
@@ -16,22 +14,13 @@ from mlm.optim import make_optimizer
 def save_config(save_dir: str, cfg: EncoderConfig) -> None:
     """The config is not part of the orbax tree, and without it there is nothing
     to rebuild the model into before restoring."""
-    d = dataclasses.asdict(cfg)
-    for k in ("dtype", "param_dtype"):
-        d[k] = getattr(cfg, k).__name__
     with open(os.path.join(save_dir, "config.json"), "w") as f:
-        json.dump(d, f, indent=2)
+        json.dump(cfg.to_json_dict(), f, indent=2)
 
 
 def load_config(save_dir: str) -> EncoderConfig:
     with open(os.path.join(save_dir, "config.json")) as f:
-        d = json.load(f)
-    # param_dtype is absent from configs written before it was split out; the
-    # dataclass default (fp32) is the right answer for those.
-    for k in ("dtype", "param_dtype"):
-        if k in d:
-            d[k] = getattr(jnp, d[k])
-    return EncoderConfig(**d)
+        return EncoderConfig.from_json_dict(json.load(f))
 
 
 def checkpoint_manager(save_dir: str, keep: int = 10):
@@ -74,6 +63,7 @@ def save_checkpoint(mgr, step: int, model: MlmEncoder, optimizer,
     data stream picks up where it stopped rather than reseeding into a different
     permutation.
     """
+    import grain
     import orbax.checkpoint as ocp
 
     items = {
@@ -91,6 +81,7 @@ def restore_data_iter(save_dir: str, data_iter, step: int) -> None:
     Checkpoints written before the pipeline moved to grain have no `data_iter`
     entry; those still resume their weights, they just restart the stream.
     """
+    import grain
     import orbax.checkpoint as ocp
 
     mgr = checkpoint_manager(save_dir)
@@ -105,11 +96,18 @@ def restore_data_iter(save_dir: str, data_iter, step: int) -> None:
         mgr.close()
 
 
-def load_checkpoint(save_dir: str, step: int | None = None):
-    """Rebuild an inference-ready model from disk. Returns (model, cfg, step)."""
+def load_checkpoint(save_dir: str, step: int | None = None, *,
+                    dropout: float | None = None):
+    """Rebuild an inference-ready model from disk. Returns (model, cfg, step).
+
+    `dropout` overrides the config's value — dropout is not a parameter, so a
+    fine-tuning stage can turn it on without touching the restored weights.
+    """
     import orbax.checkpoint as ocp
 
     cfg = load_config(save_dir)
+    if dropout is not None and dropout != cfg.dropout:
+        cfg = dataclasses.replace(cfg, dropout=dropout)
     model = MlmEncoder(cfg, rngs=nnx.Rngs(0))
     mgr = checkpoint_manager(save_dir)
     step = mgr.latest_step() if step is None else step

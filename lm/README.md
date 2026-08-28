@@ -8,19 +8,30 @@ the ModernBERT/NeoBERT consensus: RoPE, pre-RMSNorm, SwiGLU, tied embeddings,
 ## Layout
 
 ```
-lm.py            thin CLI entry point (python lm.py ... == python -m mlm ...)
+lm.py            thin CLI shim (python lm.py ... == python -m mlm ... == mlm ...)
+pyproject.toml   the installable `ka-mlm` package (workspace member; jax comes
+                 from flax's own dependency, or the accelerator wheel already
+                 on the host)
 mlm/
-  config.py      token ids, corpus constants, EncoderConfig
+  config.py      token ids, corpus constants, EncoderConfig (+ JSON codec)
+  encoding.py    the wire format: [CLS] ... [SEP] rows, content-token pooling
   model.py       encoder, sublayers, losses
-  masking.py     dynamic masking (grain RandomMap)
-  data.py        corpus streaming, BPE tokenizer, windowing, split, grain pipeline
+  masking.py     dynamic masking (pure numpy; the grain adapter lives in data.py)
+  tokenizer.py   BPE training/resolution + the special-token contract
+  data.py        corpus streaming, windowing, split, grain pipeline
   optim.py       trapezoid LR schedule, AdamW
   sharding.py    single-host data parallelism, host->device streaming
   checkpoint.py  orbax: params + Adam moments + data-stream position
+  hub.py         Hugging Face Hub sync for tokenizers and checkpoints
+  progress.py    terminal/notebook/log-adaptive progress bars
   train.py       jitted steps and the training loop
   selftest.py    architecture invariants asserted before a long run
   cli.py         flags and dispatch
 ```
+
+`import mlm` needs only jax/flax/optax — grain, orbax, datasets and
+huggingface_hub load lazily inside the functions that use them, so `--selftest`
+and downstream fine-tuning (geo_distill) run on a lean install.
 
 ## Quick start (no network needed)
 
@@ -32,7 +43,7 @@ python lm.py --smoke        # tiny synthetic end-to-end run
 ## Real runs
 
 ```bash
-pip install -r requirements.txt
+pip install -e .        # or `uv sync` at the repo root (installs the workspace)
 
 # small corpus, tokenised in memory:
 python lm.py --steps 20000 --docs 200000
@@ -119,9 +130,10 @@ must be divisible by the device count (2 on T4×2, 8 on TPU).
 **Every session, first cell:**
 
 ```
-!pip install -q flax optax orbax-checkpoint grain array_record datasets tokenizers
 !git clone https://github.com/<you>/<repo>.git   # or add the code as a Kaggle dataset
-%cd <repo>/lm
+%cd <repo>
+!pip install -q -e ./lm                          # jax stays the preinstalled CUDA/TPU build
+%cd lm
 !python -c "import jax; print(jax.devices())"    # confirm the accelerator is visible
 ```
 
@@ -193,13 +205,19 @@ excludes the compile.
 ## Fine-tuning
 
 ```python
-from mlm import load_checkpoint
+from mlm import encode_sentences, load_checkpoint, pool_content
 
-model, cfg, step = load_checkpoint("checkpoints")   # inference-ready, eval mode
-hidden = model.encode(input_ids, attention_mask)     # [B, L, hidden]
+# dropout= overrides the pretraining config without touching the weights
+model, cfg, step = load_checkpoint("checkpoints", dropout=0.1)
+tokens, mask = encode_sentences(tokenizer, sentences, max_len=64)
+hidden = model.encode(tokens, mask.astype("int32"))   # [B, L, hidden]
+pooled = pool_content(hidden, tokens)                 # [B, hidden]
 ```
 
-Mean-pool `hidden` over content tokens only (`input_ids >= N_SPECIAL`) — [CLS]
+`pool_content` mean-pools over content tokens only (`ids >= N_SPECIAL`) — [CLS]
 is an untrained attention sink here, and averaging it in folds a high-norm
 outlier into every embedding. Expect the pooled space to be anisotropic until a
 contrastive stage shapes it; MLM puts no loss on the aggregate of a sequence.
+The packaged consumer of all this is `geo-distill train --mlm-checkpoint`
+(see [`../geo_distill`](../geo_distill)), which fine-tunes the whole encoder
+against a Gemini teacher.

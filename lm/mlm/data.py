@@ -9,11 +9,12 @@ from typing import Iterable, Iterator
 import grain
 import numpy as np
 
-from mlm import hub, progress
-from mlm.config import (CLS_ID, MIN_VAL_BATCHES, MIN_WINDOW_TOKENS, N_SPECIAL,
-                        PAD_ID, SEP_ID, SPECIAL_TOKENS)
-from mlm.masking import MaskExample
+from mlm import hub
+from mlm.config import MIN_VAL_BATCHES, MIN_WINDOW_TOKENS, N_SPECIAL
+from mlm.encoding import cls_row
+from mlm.masking import mask_batch
 from mlm.progress import bar
+from mlm.tokenizer import resolve_tokenizer, train_bpe
 
 SMOKE_SENTENCES = [
     "ქართული ენა არის ქართველური ენების ჯგუფის ყველაზე გავრცელებული ენა.",
@@ -59,89 +60,6 @@ def download_texts(dataset: str, config: str, n_docs: int, smoke: bool,
             texts.append(text)
             pb.update(1)
     return texts
-
-
-def _vocab_note(tokenizer, requested: int) -> None:
-    """An authoritative tokenizer (Hub repo or local directory) defines the
-    vocabulary; say so out loud when the flag disagrees instead of silently
-    ignoring it."""
-    n = tokenizer.get_vocab_size()
-    if n != requested:
-        print(f"  note: --vocab-size {requested} is ignored — "
-              f"this tokenizer defines vocab {n}")
-
-
-def resolve_tokenizer(spec: str, vocab_size: int):
-    """A ready tokenizer from `spec`, or None when one must be trained.
-
-    `spec` is tried as, in order: a local directory holding a tokenizer.json
-    (e.g. a downloaded Hub repo); an existing local tokenizers-JSON file; an
-    hf://user/repo or bare user/repo Hub id (downloaded, never trained over —
-    a typo'd repo id errors out rather than silently training into a file of
-    that name); anything else returns None and the caller trains a fresh BPE
-    and saves it at `spec`.
-    """
-    from tokenizers import Tokenizer
-
-    if os.path.isdir(spec):
-        inner = os.path.join(spec, "tokenizer.json")
-        if not os.path.isfile(inner):
-            raise RuntimeError(
-                f"--tokenizer-path {spec} is a directory without a "
-                f"tokenizer.json — point at the file itself, or at a Hub repo id"
-            )
-        tok = Tokenizer.from_file(inner)
-        print(f"loaded tokenizer from {inner} (vocab {tok.get_vocab_size()})")
-        _vocab_note(tok, vocab_size)
-        return tok
-    if os.path.isfile(spec):
-        cached = Tokenizer.from_file(spec)
-        n = cached.get_vocab_size()
-        # A cache smaller than requested is normal — the corpus may not support
-        # the full budget. A cache *larger* than requested means --vocab-size was
-        # lowered since it was built, and silently reusing it would train a model
-        # with a different vocabulary than the flags describe.
-        if n <= vocab_size:
-            print(f"reusing tokenizer {spec} (vocab {n})")
-            return cached
-        print(f"{spec} has vocab {n} > requested {vocab_size}; retraining")
-        return None
-    if hub.is_hub_id(spec) and not os.path.isdir(os.path.dirname(spec)):
-        # A bare user/repo whose parent directory exists locally stays a
-        # *training target* (--tokenizer-path tokenizers/kabpe worked before
-        # the Hub integration and still does); hf://user/repo always names the
-        # Hub, since "hf://user" can never be a local directory.
-        tok = hub.load_hub_tokenizer(spec)
-        _vocab_note(tok, vocab_size)
-        return tok
-    return None
-
-
-def train_tokenizer(texts: Iterable[str], vocab_size: int, path: str):
-    """Byte-level BPE trained on the target language only, saved to `path`."""
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
-
-    n_docs = f" on {len(texts)} documents" if hasattr(texts, "__len__") else ""
-    print(f"training a {vocab_size}-token BPE{n_docs} — "
-          f"takes a few minutes on a full corpus ...", flush=True)
-    tok = Tokenizer(models.BPE(unk_token="[UNK]"))
-    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
-    tok.decoder = decoders.ByteLevel()
-    trainer = trainers.BpeTrainer(
-        vocab_size=vocab_size,
-        special_tokens=SPECIAL_TOKENS,
-        # Without this, only bytes that occur in the training corpus enter the
-        # vocabulary and everything else falls back to [UNK] at inference — for
-        # a Georgian corpus that silently guts Latin, digits and punctuation.
-        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
-        # The Rust bar redraws with carriage returns, which only a real terminal
-        # renders; piped or notebook-captured output would get one line
-        # kilometres wide.
-        show_progress=progress.raw_terminal(),
-    )
-    tok.train_from_iterator(texts, trainer=trainer)
-    tok.save(path)
-    return tok
 
 
 def push_tokenizer_if_asked(args, vocab_size: int) -> None:
@@ -281,11 +199,7 @@ def _windows(ids, seq_len: int):
         # document outright and roughly a quarter of all document tails.
         if len(window) < MIN_WINDOW_TOKENS:
             continue
-        row = np.full(seq_len, PAD_ID, dtype=np.int32)
-        row[0] = CLS_ID
-        row[1:1 + len(window)] = window
-        row[1 + len(window)] = SEP_ID
-        yield row
+        yield cls_row(window, seq_len)
 
 
 def split_by_document(doc_ids, val_frac: float, batch_size: int, seed: int):
@@ -361,7 +275,7 @@ def tokenize_to(args, out_dir: str) -> None:
             timings["sample"] = time.time() - t0
 
             t0 = time.time()
-            tokenizer = train_tokenizer(sample, args.vocab_size, args.tokenizer_path)
+            tokenizer = train_bpe(sample, args.vocab_size, args.tokenizer_path)
             timings["train tokenizer"] = time.time() - t0
         else:
             # An already-available tokenizer (local cache or Hub) makes the
@@ -441,6 +355,25 @@ def decode_record(raw: bytes) -> np.ndarray:
     return np.frombuffer(raw, dtype="<i4").astype(np.int32)
 
 
+class MaskExample(grain.transforms.RandomMap):
+    """Per-example dynamic masking.
+
+    Grain derives this element's RNG from its index by resetting a Philox
+    counter, so the mask a given window receives is a pure function of that
+    index. Two consequences worth having: changing --batch-size no longer
+    changes every mask, and a resumed run reproduces masks exactly rather than
+    relying on the RNG state having been checkpointed.
+    """
+
+    def __init__(self, mask_prob: float, n_pred: int):
+        self.mask_prob = mask_prob
+        self.n_pred = n_pred
+
+    def random_map(self, row, rng):
+        out = mask_batch(row, rng, self.mask_prob, self.n_pred)
+        return {k: v[0] for k, v in out.items()}  # drop the batch axis
+
+
 def make_dataset(source, batch_size: int, mask_prob: float, n_pred: int,
                  seed: int, *, decode: bool = False, repeat: bool = True):
     """The whole input pipeline.
@@ -505,7 +438,7 @@ def load_sources(args):
         tokenizer, vocab_size = ByteTokenizer(), ByteTokenizer.vocab
     else:
         if tokenizer is None:
-            tokenizer = train_tokenizer(texts, args.vocab_size, args.tokenizer_path)
+            tokenizer = train_bpe(texts, args.vocab_size, args.tokenizer_path)
         vocab_size = tokenizer.get_vocab_size()
         push_tokenizer_if_asked(args, vocab_size)
 

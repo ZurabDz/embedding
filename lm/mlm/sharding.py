@@ -1,7 +1,5 @@
 """Device placement: single-host data parallelism and host->device streaming."""
 
-import grain
-import grain.experimental
 import jax
 from flax import nnx
 import jax.numpy as jnp
@@ -64,6 +62,8 @@ def to_device(batch: dict, sharding):
 
 def device_stream(iter_ds, sharding):
     """Overlap host masking with device compute, and double-buffer on device."""
+    import grain.experimental
+
     target = sharding if sharding is not None else jax.devices()[0]
     return grain.experimental.device_put(
         iter_ds, target, cpu_buffer_size=4, device_buffer_size=2)

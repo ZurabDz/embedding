@@ -1,7 +1,8 @@
 """Student artifact IO: atomic writes and config/params save + load.
 
-flax is imported lazily inside the functions that need it, so the atomic-write
-helpers stay importable from teacher.py, which is deliberately jax-free.
+flax and the students registry (which pulls in mlm -> jax) are imported lazily
+inside the functions that need them, so the atomic-write helpers stay
+importable from teacher.py, which is deliberately jax-free.
 """
 from __future__ import annotations
 
@@ -10,7 +11,6 @@ import os
 import numpy as np
 
 from geo_distill import config as paths
-from geo_distill.students import StudentConfig, spec_for
 
 
 def atomic_write_bytes(path: str, data: bytes) -> None:
@@ -51,6 +51,8 @@ def load_student(model_dir: str):
     """Rebuild the student described by <model_dir>/student_config.json and
     restore its best parameters. Returns (model, cfg, spec)."""
     from flax import nnx, serialization
+
+    from geo_distill.students import StudentConfig, spec_for
 
     cfg = StudentConfig.load(os.path.join(model_dir, paths.STUDENT_CONFIG))
     spec = spec_for(cfg.student_type)

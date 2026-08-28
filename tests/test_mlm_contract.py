@@ -19,6 +19,17 @@ def test_import_mlm_is_lean():
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
+def test_import_teacher_is_jax_free():
+    """The teacher stage (Gemini client + synthetic stand-in) deliberately
+    avoids jax so it stays cheap to run anywhere."""
+    code = (
+        "import sys; import geo_distill.teacher; "
+        "assert 'jax' not in sys.modules and 'flax' not in sys.modules, "
+        "[m for m in sys.modules if m in ('jax', 'flax')]"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
 def test_legacy_config_loads():
     """The exact shape of a pre-param_dtype config.json (what old local runs
     and the ka-mlm Hub repo hold) must keep loading, with fp32 defaults."""

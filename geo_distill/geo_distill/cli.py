@@ -14,8 +14,9 @@ from geo_distill import config as paths
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="geo-distill",
-        description="Distill Gemini teacher embeddings into a small Georgian "
-                    "student model (see each subcommand's --help).")
+        description="Distill teacher embeddings (the Gemini API, or a local "
+                    "Qwen3-Embedding model) into a small Georgian student "
+                    "model (see each subcommand's --help).")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     d = sub.add_parser("data", help="stream a HF corpus into clean, deduplicated "
@@ -64,6 +65,67 @@ def build_parser() -> argparse.ArgumentParser:
     te.add_argument("--checkpoint-every", type=int, default=500,
                     help="snapshot the output files every N new embeddings so a "
                          "running train sees partial progress (0=only at end)")
+
+    lt = sub.add_parser("local-teacher",
+                        help="embed the sentences with a local open-weights "
+                             "teacher (Qwen3-Embedding; needs torch+transformers "
+                             "— preinstalled on Kaggle, or the [local-teacher] "
+                             "extra locally)")
+    lt.add_argument("--input", default=paths.DATA_SENTENCES)
+    lt.add_argument("--cache-dir", default=paths.LOCAL_TEACHER_CACHE,
+                    help="shard cache root; each settings combo gets its own "
+                         "subdirectory, so nothing stale is ever reused")
+    lt.add_argument("--out-emb", default=paths.TEACHER_EMB)
+    lt.add_argument("--out-sents", default=paths.SENTENCES_JSON)
+    lt.add_argument("--out-meta", default=paths.TEACHER_META)
+    lt.add_argument("--model", default=paths.DEFAULT_LOCAL_TEACHER_MODEL,
+                    help="HF model id — part of the cache config key, so "
+                         "changing it re-embeds everything; Qwen3-Embedding-"
+                         "0.6B/4B fit one GPU (or CPU for smoke runs)")
+    lt.add_argument("--batch-size", type=int, default=16,
+                    help="sentences per forward pass; halved automatically on "
+                         "GPU OOM")
+    lt.add_argument("--input-type", default="passage", choices=["passage", "query"],
+                    help="Use one consistent type for the whole corpus.")
+    lt.add_argument("--instruction", default=None,
+                    help="instruction prefix for --input-type query (default: "
+                         "a generic retrieval instruction); passages are "
+                         "always embedded plain")
+    lt.add_argument("--output-dim", type=int, default=1024,
+                    help="Matryoshka truncation, 32..4096 for Qwen3-8B "
+                         "(re-normalized; the native dim = no truncation). "
+                         "The student's output head matches this.")
+    lt.add_argument("--max-seq-len", type=int, default=512,
+                    help="token truncation cap; batches pad to their own "
+                         "longest sequence, so short batches never pay for this")
+    lt.add_argument("--device-map", default="auto",
+                    help='"auto" splits the model across all GPUs (the 8B '
+                         'needs both Kaggle T4s); also "cpu", "cuda:0", ...')
+    lt.add_argument("--dtype", default="auto",
+                    choices=["auto", "float16", "bfloat16", "float32"],
+                    help="model compute dtype; auto = float16 on CUDA, "
+                         "float32 on CPU")
+    lt.add_argument("--store-dtype", default="float32",
+                    choices=["float32", "float16"],
+                    help="dtype of the merged teacher_emb.npy (cache shards "
+                         "are always float16); float16 halves the Hub upload")
+    lt.add_argument("--checkpoint-every", type=int, default=2048,
+                    help="cache shard size: resume granularity AND the most "
+                         "work a crash can lose (0 = one shard, only at end)")
+    lt.add_argument("--push-to", default=paths.DEFAULT_TEACHER_DATASET_REPO,
+                    help="HF *dataset* repo for the artifacts, pushed after "
+                         "generation (partial runs too); write access is "
+                         "verified up front, before the GPU run")
+    lt.add_argument("--no-push", action="store_true",
+                    help="skip the Hub entirely (offline/smoke runs)")
+
+    ft = sub.add_parser("fetch-teacher",
+                        help="download teacher artifacts from a HF dataset "
+                             "repo (pushed by local-teacher --push-to) into "
+                             "artifacts/")
+    ft.add_argument("repo", nargs="?", default=paths.DEFAULT_TEACHER_DATASET_REPO,
+                    help="dataset repo id (default: %(default)s)")
+    ft.add_argument("--out-dir", default=paths.ARTIFACTS_DIR)
 
     st = sub.add_parser("synthetic-teacher",
                         help="offline stand-in for the teacher: fabricates a "
@@ -159,6 +221,10 @@ def main(argv=None) -> None:
         from geo_distill.tokenizer import run
     elif args.cmd == "teacher":
         from geo_distill.teacher import run
+    elif args.cmd == "local-teacher":
+        from geo_distill.local_teacher import run
+    elif args.cmd == "fetch-teacher":
+        from geo_distill.hub import run_fetch as run
     elif args.cmd == "synthetic-teacher":
         from geo_distill.teacher import run_synthetic as run
     elif args.cmd == "train":

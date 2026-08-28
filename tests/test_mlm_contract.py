@@ -30,6 +30,19 @@ def test_import_teacher_is_jax_free():
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
+def test_import_local_teacher_is_torch_free():
+    """The local-teacher stage keeps torch/transformers (and jax) out of its
+    import chain — they load lazily inside make_encoder, so the CLI and the
+    offline tests never need them installed."""
+    code = (
+        "import sys; import geo_distill.local_teacher, geo_distill.hub; "
+        "heavy = [m for m in sys.modules if m in ('torch', 'jax', 'flax') "
+        "or m.startswith('transformers')]; "
+        "assert not heavy, heavy"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
 def test_legacy_config_loads():
     """The exact shape of a pre-param_dtype config.json (what old local runs
     and the ka-mlm Hub repo hold) must keep loading, with fp32 defaults."""

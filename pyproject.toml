@@ -9,6 +9,10 @@ dependencies = [
     "geo-distill",
 ]
 
+[project.optional-dependencies]
+# Passthrough so `uv sync --extra local-teacher` works from the workspace root.
+local-teacher = ["geo-distill[local-teacher]"]
+
 [dependency-groups]
 dev = [
     "pytest>=8",

@@ -16,6 +16,17 @@ dependencies = [
     "python-dotenv>=1.0",        # only the `teacher` subcommand (.dotenv key loading)
 ]
 
+[project.optional-dependencies]
+# `local-teacher` subcommand only. Floors, not pins: on Kaggle/Colab torch,
+# transformers and accelerate are preinstalled with the right CUDA wheels and
+# must not be replaced — install WITHOUT this extra there (plain
+# `pip install -q -e ./geo_distill`). The extra exists for local CPU smoke runs.
+local-teacher = [
+    "torch>=2.2",
+    "transformers>=4.51",    # Qwen3 architecture support floor
+    "accelerate>=1.0",       # device_map="auto" multi-GPU split for the 8B
+]
+
 [project.scripts]
 geo-distill = "geo_distill.cli:main"
 

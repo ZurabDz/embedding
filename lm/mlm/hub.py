@@ -85,7 +85,7 @@ def load_hub_tokenizer(spec: str):
     return tok
 
 
-def ensure_writable(repo: str) -> None:
+def ensure_writable(repo: str, repo_type: str = "model") -> None:
     """Create (or confirm) the target repo in one cheap round-trip, up front.
 
     Token *presence* is not enough: Kaggle/Colab HF tokens are often read-scoped
@@ -94,12 +94,16 @@ def ensure_writable(repo: str) -> None:
     write scope and namespace ownership; it is idempotent, so push_tokenizer's
     later create_repo is a no-op. Side effect worth knowing: the (private) repo
     exists even if the run later dies before pushing anything.
+
+    repo_type matters: model and dataset ids are separate namespaces, so
+    checking a dataset push against the default would create a stray model repo.
     """
     from huggingface_hub import HfApi
 
     repo = strip_prefix(repo)
     try:
-        HfApi(token=hf_token()).create_repo(repo_id=repo, exist_ok=True, private=True)
+        HfApi(token=hf_token()).create_repo(repo_id=repo, repo_type=repo_type,
+                                            exist_ok=True, private=True)
     except Exception as e:
         raise RuntimeError(
             f"cannot push to hf.co/{repo}: {e}\n"

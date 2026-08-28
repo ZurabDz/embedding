@@ -1,8 +1,10 @@
 # Distilling a Georgian embedding model (JAX / Flax NNX)
 
 Train a sentence-embedding model that reproduces the geometry of a large
-teacher (Google's `gemini-embedding-2`) on Georgian text. This is *knowledge
-distillation for embeddings*, with two students sharing one training loop:
+teacher — Google's `gemini-embedding-2` via API, or a local open-weights
+`Qwen/Qwen3-Embedding-8B` on free Kaggle GPUs — on Georgian text. This is
+*knowledge distillation for embeddings*, with two students sharing one
+training loop:
 
 - a **tiny from-scratch transformer** (~0.5–3M params before the output
   projection) — the educational baseline;
@@ -41,7 +43,9 @@ installed `geo-distill` script; every stage has `--help`):
 ```
 data               → data/sentences.txt        (Georgian sentences)
 tokenizer          → artifacts/tokenizer.json  (BPE/Unigram, mlm-compatible specials)
-teacher            → artifacts/teacher_emb.npy (teacher vectors, cached)   [or: synthetic-teacher]
+teacher            → artifacts/teacher_emb.npy (teacher vectors, cached)
+  [alternatives: local-teacher (GPU, no rate limits) · synthetic-teacher (offline)]
+fetch-teacher      ← pulls the same artifacts back from a HF dataset repo
 train              → <out-dir>/student_*.{json,msgpack} + teacher_mean.npy
 eval               → correlation + retrieval demo
 ```
@@ -53,11 +57,15 @@ installs `geo-distill` and its `ka-mlm` dependency editable):
 
 ```bash
 uv sync
+# + torch/transformers for local CPU smoke runs of the local-teacher stage:
+uv sync --extra local-teacher
 ```
 
 On Kaggle/Colab: `!pip install -q -e ./lm -e ./geo_distill` from the repo root
 (jax with the right accelerator wheel is preinstalled there; the packages only
-add floors on top of it).
+add floors on top of it). Do **not** install the `local-teacher` extra there —
+torch/transformers/accelerate are preinstalled with the right CUDA wheels and
+must not be replaced.
 
 ## Run it
 
@@ -92,6 +100,67 @@ free on the next run, so a large corpus can be embedded across several days.
 Daily usage is tracked in `teacher_usage.json`. The teacher model id is a flag
 (`--model`, default `gemini-embedding-2`) and is part of the cache key —
 changing it re-embeds everything.
+
+**3b. Local teacher (Qwen3-Embedding — free, needs GPUs).** The API-free
+alternative: `local-teacher` embeds the corpus with an open-weights teacher
+(default `Qwen/Qwen3-Embedding-8B`, Apache-2.0, Georgian among Qwen3's 119
+languages) and writes the *same three artifacts*, so everything downstream is
+unchanged. There are no rate limits — a 100k-sentence corpus is hours of free
+Kaggle GPU time instead of weeks of API quota.
+
+```bash
+python -m geo_distill local-teacher                 # pushes to the HF dataset repo when done
+python -m geo_distill local-teacher --no-push       # offline / smoke runs
+# smaller teachers for one GPU or CPU smoke tests:
+python -m geo_distill local-teacher --model Qwen/Qwen3-Embedding-0.6B --no-push
+```
+
+Details worth knowing:
+
+- **Dims.** The 8B is natively 4096-dim; the default `--output-dim 1024`
+  truncates + re-normalizes (Matryoshka), keeping `teacher_emb.npy` ~4× smaller
+  and the student's output head small. Pass `--output-dim 4096` for the full
+  space.
+- **Hardware.** fp16 8B weights (~16 GB) need both Kaggle T4s —
+  `--device-map auto` (the default) splits the layers across them.
+  `--batch-size` halves itself on OOM.
+- **Cache & resume.** Embeddings land in fp16 shards under
+  `artifacts/local_teacher_cache/<config-key>/` every `--checkpoint-every`
+  sentences; a killed run loses at most one shard and re-runs resume for free.
+  The config key hashes model/settings/corpus, so changed settings never reuse
+  stale vectors.
+- **Kaggle session caps.** `--push-to` (default `ZurabDz/geo-teacher-qwen3-8b`,
+  created private) uploads the artifacts after every run, *partial ones too*;
+  a fresh session runs `fetch-teacher`, and `local-teacher` re-seeds its shard
+  cache from the fetched artifacts and continues. Write access is verified
+  up front, before any GPU time is spent.
+- **Prompting.** `--input-type passage` (the default) embeds text plain;
+  `query` applies Qwen3's `Instruct: ...\nQuery:` prefix (`--instruction`
+  overrides the instruction). As with the Gemini teacher: one consistent type
+  for the whole corpus.
+
+A Kaggle T4×2 notebook, first cell to last:
+
+```
+!git clone https://github.com/<you>/embedding.git
+%cd embedding
+!pip install -q -e ./lm -e ./geo_distill
+import os
+from kaggle_secrets import UserSecretsClient
+os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+%cd /kaggle/working
+!python -m geo_distill data --n 100000
+# resuming a session that died mid-run? pull its partial results first:
+# !python -m geo_distill fetch-teacher
+!python -m geo_distill local-teacher
+```
+
+The training session (any machine) then starts with:
+
+```bash
+python -m geo_distill fetch-teacher    # → artifacts/teacher_emb.npy + sentences.json
+python -m geo_distill train --mlm-checkpoint ZurabDz/ka-mlm --tokenizer ZurabDz/ka-bpe-32k ...
+```
 
 **4. Distill** (from scratch):
 ```bash
@@ -171,6 +240,8 @@ python -m geo_distill eval --query "ქართული ღვინო და
 | `data.py` | corpus download; tokenizer loading, batch encoding, stable val split |
 | `tokenizer.py` | train a BPE (shared `mlm` recipe) or Unigram, five specials at 0–4 |
 | `teacher.py` | Gemini teacher client (cached, rate-limited) + the synthetic stand-in |
+| `local_teacher.py` | local open-weights teacher (Qwen3-Embedding): fp16 shard cache, multi-GPU inference, OOM backoff |
+| `hub.py` | push/pull the teacher artifacts through a private HF *dataset* repo |
 | `model.py` | tiny from-scratch encoder → mean-pool → projection → L2-norm |
 | `mlm_student.py` | student wrapping the pretrained MLM encoder (head stripped) |
 | `students.py` | the scratch/mlm registry + the typed `StudentConfig` |

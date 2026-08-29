@@ -251,6 +251,17 @@ What is in a checkpoint, and why:
   wants the second. Restoring only parameters would re-warm the learning rate
   from zero and replay epoch 0's dropout masks; with all of it, a resumed run
   reproduces the uninterrupted one exactly.
+- `--val-metric-n N` (default 4096) bounds the epoch metric. It builds two
+  dense n×n similarity matrices **in host RAM**, so its cost is quadratic in the
+  held-out row count and nothing else: 4096 rows is ~270 MB and 8M sentence
+  pairs, while a 500k-sentence corpus at `--val-frac 0.1` leaves 50k held out
+  and asks for 40 GB — which arrives as an OOM *kill* at the first epoch
+  boundary, after the training and before any checkpoint, so the run vanishes
+  with nothing on disk. The scored subset is picked by content hash, so it is
+  the same one every epoch and in every rerun on the same corpus; `0` scores
+  the whole split (and `similarity_agreement` refuses above 10k rows rather
+  than letting the kernel decide). `eval` takes the same flag, so the number it
+  prints is the one the epoch lines were reporting.
 - `--log-every N` (default 50) prints a progress line inside the epoch — the
   mean loss since the previous line, the learning rate, steps/s and an ETA for
   the remaining training steps (validation and pushes are not in that clock, so

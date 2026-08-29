@@ -39,7 +39,7 @@ from geo_distill.checkpoint import (atomic_np_save, load_student_state,
                                     load_train_state, save_student_config,
                                     save_student_params, save_student_state,
                                     save_train_state)
-from geo_distill.data import load_tokenizer, val_split
+from geo_distill.data import load_tokenizer, metric_subset, val_split
 from geo_distill.losses import cosine_regression_loss, kl_sim_loss, mse_sim_loss
 from geo_distill.metrics import similarity_agreement
 from geo_distill.model import EmbeddingModel, embed_in_batches, param_count
@@ -229,6 +229,19 @@ def run(args) -> None:
 
     tr_tokens, tr_mask, tr_teacher = tokens[train_idx], mask[train_idx], teacher[train_idx]
     va_tokens, va_mask, va_teacher = tokens[val_idx], mask[val_idx], teacher[val_idx]
+
+    # The epoch metric is quadratic in host RAM, so it scores a bounded subset
+    # of the held-out split rather than all of it — see data.metric_subset. It
+    # is sliced here, before the encoder ever runs on those rows, so the cap
+    # also buys back the per-epoch embedding pass.
+    keep = metric_subset([sentences[i] for i in val_idx], args.val_metric_n,
+                         args.seed)
+    if keep is None:
+        print(f"val: {len(val_idx)} held-out sentences, all scored")
+    else:
+        va_tokens, va_mask, va_teacher = va_tokens[keep], va_mask[keep], va_teacher[keep]
+        print(f"val: {len(val_idx)} held-out sentences, scoring a fixed "
+              f"{len(keep)}-sentence subset each epoch")
 
     # ---- regression targets: the teacher vectors, no dim projection -------- #
     # The student outputs in the teacher's full space (out_dim == teacher_dim).
@@ -471,7 +484,13 @@ def run(args) -> None:
                       flush=True)
                 win_t0, win_seen, win_loss = now, seen, 0.0
 
-        # evaluate on the held-out set (dropout off, then back on for training)
+        # evaluate on the held-out set (dropout off, then back on for training).
+        # This runs *before* the checkpoint on purpose: the epoch's score has to
+        # be in hand for the checkpoint to record it, and a resume that found a
+        # stale best would overwrite genuinely-better parameters with a weaker
+        # epoch. That is only safe because the scored set is bounded — an
+        # unbounded metric here is what turns a crash in the scoring into a
+        # whole epoch of lost GPU time.
         model.eval()
         va_student = embed_in_batches(model, va_tokens, va_mask)
         if args.dropout > 0:

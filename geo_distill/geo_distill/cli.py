@@ -223,6 +223,15 @@ def build_parser() -> argparse.ArgumentParser:
                          "loss (0 = pure regression, the default)")
     tr.add_argument("--sim-loss", default="kl", choices=["mse", "kl"])
     tr.add_argument("--temperature", type=float, default=0.05)
+    tr.add_argument("--val-metric-n", type=int, default=paths.DEFAULT_METRIC_ROWS,
+                    help="how many held-out sentences the agreement metric "
+                         "scores (0 = all of them). It builds two dense n x n "
+                         "matrices in host RAM, so the cost is quadratic: the "
+                         "default is ~270 MB and 8M sentence pairs, while a "
+                         "50k-sentence val split would ask for 40 GB and be "
+                         "OOM-killed. The subset is picked by content hash, so "
+                         "it is the same one every epoch and in every rerun on "
+                         "the same corpus")
     tr.add_argument("--log-every", type=int, default=50,
                     help="print an in-epoch progress line every N steps: the "
                          "mean loss since the previous line, the learning rate, "
@@ -268,6 +277,15 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--teacher-emb", default=paths.TEACHER_EMB)
     ev.add_argument("--val-frac", type=float, default=0.1)
     ev.add_argument("--seed", type=int, default=0)
+    ev.add_argument("--val-metric-n", type=int, default=paths.DEFAULT_METRIC_ROWS,
+                    help="how many held-out sentences the agreement metric "
+                         "scores (0 = all of them). It builds two dense n x n "
+                         "matrices in host RAM, so the cost is quadratic: the "
+                         "default is ~270 MB and 8M sentence pairs, while a "
+                         "50k-sentence val split would ask for 40 GB and be "
+                         "OOM-killed. The subset is picked by content hash, so "
+                         "it is the same one every epoch and in every rerun on "
+                         "the same corpus")
     ev.add_argument("--query", default=None)
     ev.add_argument("--topk", type=int, default=5)
 

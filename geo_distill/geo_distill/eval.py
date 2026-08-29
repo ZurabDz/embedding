@@ -10,7 +10,7 @@ import numpy as np
 
 from geo_distill import config as paths
 from geo_distill.checkpoint import load_student
-from geo_distill.data import load_tokenizer, val_split
+from geo_distill.data import load_tokenizer, metric_subset, val_split
 from geo_distill.metrics import similarity_agreement
 from geo_distill.model import embed_in_batches
 
@@ -29,11 +29,20 @@ def run(args) -> None:
 
     va_sents = [sentences[i] for i in val_idx]
     va_teacher = teacher[val_idx]
+    # The same bounded subset the training loop scored, given the same corpus,
+    # --val-frac, --seed and --val-metric-n — so this number is the one the
+    # epoch lines were reporting, not a differently-drawn benchmark.
+    keep = metric_subset(va_sents, args.val_metric_n, args.seed)
+    if keep is not None:
+        va_sents = [va_sents[i] for i in keep]
+        va_teacher = va_teacher[keep]
     va_tokens, va_mask = spec.encode(tok, va_sents, cfg.max_len)
     va_student = embed_in_batches(model, va_tokens, va_mask)
 
     m = similarity_agreement(va_student, va_teacher)
-    print("Held-out agreement with teacher:")
+    scored = (f"{len(va_sents)} of {len(val_idx)}" if keep is not None
+              else f"all {len(val_idx)}")
+    print(f"Held-out agreement with teacher ({scored} held-out sentences):")
     print(f"  Pearson  (similarity) : {m['pearson']:.3f}")
     print(f"  Spearman (similarity) : {m['spearman']:.3f}")
     print(f"  top-1 NN agreement    : {m['top1_nn_agreement']:.3f}")

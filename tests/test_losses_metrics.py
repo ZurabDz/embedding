@@ -2,9 +2,9 @@
 import numpy as np
 import pytest
 
-from geo_distill.data import val_split
+from geo_distill.data import metric_subset, val_split
 from geo_distill.losses import cosine_regression_loss, kl_sim_loss, mse_sim_loss
-from geo_distill.metrics import similarity_agreement
+from geo_distill.metrics import MAX_METRIC_ROWS, similarity_agreement
 
 
 @pytest.fixture(scope="module")
@@ -75,3 +75,36 @@ def test_val_split_tiny_corpus_fallback(sentences):
     tr, va = val_split(tiny, 0.1, seed=0)
     assert len(va) >= 2 and len(tr) >= 1
     assert sorted(list(tr) + list(va)) == list(range(len(tiny)))
+
+
+# --------------------------------------------------------------------------- #
+# The metric is quadratic in host RAM, so its input has to stay bounded
+# --------------------------------------------------------------------------- #
+def test_similarity_agreement_refuses_an_unbounded_val_set():
+    """The failure this guards is an OOM *kill*, not a catchable MemoryError:
+    at 50k rows the two similarity matrices alone are 40 GB, and the kernel
+    takes the whole run down after the epoch and before any checkpoint."""
+    n = MAX_METRIC_ROWS + 1
+    with pytest.raises(ValueError, match="--val-metric-n"):
+        # zero-sized rows: the guard has to fire before anything is allocated
+        similarity_agreement(np.zeros((n, 0), np.float32), np.zeros((n, 0), np.float32))
+
+
+def test_metric_subset_bounds_and_is_stable():
+    sents = [f"sentence number {i}" for i in range(500)]
+    assert metric_subset(sents, 0) is None          # 0 = score everything
+    assert metric_subset(sents, 500) is None        # already fits
+    assert metric_subset(sents, 900) is None
+
+    keep = metric_subset(sents, 64)
+    assert len(keep) == 64 and len(set(keep.tolist())) == 64
+    assert (np.diff(keep) > 0).all()                # sorted, so slicing is cheap
+    assert keep.max() < len(sents)
+    # Same set every epoch and in every rerun — that is what makes the
+    # epoch-to-epoch scores and the best-checkpoint comparison mean anything.
+    np.testing.assert_array_equal(keep, metric_subset(sents, 64))
+    # ...and it follows the text, not the position in the list.
+    shuffled = list(reversed(sents))
+    assert {sents[i] for i in keep} == {shuffled[i] for i in metric_subset(shuffled, 64)}
+    # A different seed draws a different subset.
+    assert not np.array_equal(keep, metric_subset(sents, 64, seed=1))

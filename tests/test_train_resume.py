@@ -47,6 +47,43 @@ def epoch_lines(capsys):
 
 
 # --------------------------------------------------------------------------- #
+# What reaches the (quadratic) epoch metric
+# --------------------------------------------------------------------------- #
+def test_val_metric_n_bounds_what_the_epoch_metric_sees(workdir, monkeypatch, capsys):
+    """The epoch metric builds two dense n x n matrices in host RAM. On a real
+    corpus the val split is ~50k sentences, which is 40 GB and an OOM kill at
+    the first epoch boundary — after the training, before any checkpoint. The
+    loop must hand it the capped subset, not the whole split."""
+    from geo_distill import train as gt
+
+    seen = []
+    real = gt.similarity_agreement
+    monkeypatch.setattr(gt, "similarity_agreement",
+                        lambda s, t, **kw: seen.append(len(s)) or real(s, t, **kw))
+
+    gt.run(train_args("--epochs", "2", "--val-metric-n", "4"))
+    out = capsys.readouterr().out
+
+    assert seen and set(seen) == {4}, f"metric saw {set(seen)} rows, wanted 4"
+    assert "scoring a fixed 4-sentence subset" in out
+    # and the embedding pass is capped with it, not just the metric
+    assert len(seen) == 2
+
+
+def test_val_metric_n_zero_scores_the_whole_split(workdir, monkeypatch, capsys):
+    from geo_distill import train as gt
+
+    seen = []
+    real = gt.similarity_agreement
+    monkeypatch.setattr(gt, "similarity_agreement",
+                        lambda s, t, **kw: seen.append(len(s)) or real(s, t, **kw))
+
+    gt.run(train_args("--epochs", "1", "--val-metric-n", "0"))
+    assert "all scored" in capsys.readouterr().out
+    assert seen and seen[0] > 4
+
+
+# --------------------------------------------------------------------------- #
 # The state itself
 # --------------------------------------------------------------------------- #
 def test_student_state_roundtrip(tmp_path, bpe_tokenizer):

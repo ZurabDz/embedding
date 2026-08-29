@@ -84,6 +84,36 @@ def val_split(sentences, val_frac: float, seed: int = 0):
     return np.array(train_idx), np.array(val_idx)
 
 
+def metric_subset(val_sentences, max_rows: int, seed: int = 0):
+    """Positions inside the val split that the O(n^2) agreement metric scores.
+
+    None when the whole split already fits. The metric builds two dense n x n
+    similarity matrices in host RAM, so its cost is quadratic: 50k held-out
+    sentences ask for 20 GB *each*, which arrives as an OOM kill at the first
+    epoch boundary rather than as an error.
+
+    Chosen by content hash rather than by position, so the subset depends only
+    on *which* sentences are held out: the same set every epoch, in a rerun and
+    across a --resume, which is what makes the epoch-to-epoch scores and the
+    best-checkpoint comparison mean anything. A separate salt keeps the draw
+    independent of the one that put the sentence in val to begin with.
+
+    Unlike val_split this is a fixed *size*, not a fixed hash threshold —
+    memory is the binding constraint here, and a threshold's subset grows with
+    the corpus. So growing the corpus re-draws this subset (overlap decays as
+    the ratio of the two val sizes): scores are comparable within a corpus, not
+    across two different ones.
+    """
+    n = len(val_sentences)
+    if not max_rows or n <= max_rows:
+        return None
+    # First 64 bits of the digest: enough to order 50k sentences without ties,
+    # and an int64 argsort instead of a Python-object one.
+    h = np.array([int(hashlib.sha1(f"{seed}\x01{s}".encode("utf-8")).hexdigest()[:16], 16)
+                  for s in val_sentences], dtype=np.uint64)
+    return np.sort(np.argsort(h, kind="stable")[:max_rows])
+
+
 # --------------------------------------------------------------------------- #
 # Corpus download (the `data` subcommand)
 # --------------------------------------------------------------------------- #

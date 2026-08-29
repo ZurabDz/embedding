@@ -51,3 +51,9 @@ DEFAULT_TEACHER_DATASET_REPO = "ZurabDz/geo-teacher-qwen3-8b"
 # `train --push-to` does NOT — pushing needs a write token and replaces whatever
 # the repo holds, so it stays opt-in.
 DEFAULT_STUDENT_MODEL_REPO = "ZurabDz/ka-embed"
+
+
+# Evaluation: how many held-out sentences the agreement metric scores. It
+# builds two dense n x n matrices in host RAM, so the cost is quadratic in this
+# number and nothing else — see metrics.similarity_agreement.
+DEFAULT_METRIC_ROWS = 4096

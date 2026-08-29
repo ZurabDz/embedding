@@ -82,23 +82,36 @@ def build_parser() -> argparse.ArgumentParser:
                     help="HF model id — part of the cache config key, so "
                          "changing it re-embeds everything; Qwen3-Embedding-"
                          "0.6B/4B fit one GPU (or CPU for smoke runs)")
+    lt.add_argument("--backend", default="transformers",
+                    choices=["transformers", "vllm"],
+                    help="vllm runs the model TENSOR-parallel — every layer "
+                         "on all GPUs at once, the only true dual-GPU mode "
+                         "on Kaggle's no-P2P T4s (install per session: pip "
+                         "install vllm==0.28.0). transformers splits layers "
+                         "across GPUs, which take turns. Backends differ by "
+                         "fp16 kernel noise, so each gets its own cache key")
+    lt.add_argument("--tensor-parallel", type=int, default=0,
+                    help="vllm only: GPUs to shard across (0 = all visible)")
+    lt.add_argument("--gpu-memory-utilization", type=float, default=0.88,
+                    help="vllm only: fraction of each GPU vLLM may reserve")
     lt.add_argument("--batch-size", type=int, default=2048,
                     help="sentences handed to the encoder per call; the "
                          "encoder packs its own forward passes, so the "
-                         "OOM-adaptive knob is --micro-batch-tokens")
+                         "OOM-adaptive knob is --micro-batch-tokens "
+                         "(transformers backend; vllm takes whole shards)")
     lt.add_argument("--micro-batch-tokens", type=int, default=16384,
-                    help="padded-token budget per forward pass; shrunk for "
-                         "good on GPU OOM (floor: a single sequence)")
+                    help="transformers backend: padded-token budget per "
+                         "forward pass; shrunk for good on GPU OOM (floor: "
+                         "a single sequence)")
     lt.add_argument("--pipeline-threads", type=int, default=3,
-                    help="micro-batches kept in flight when the model is "
-                         "split across 2+ GPUs, so the pipeline stages "
-                         "overlap instead of taking turns; 1 = sequential "
-                         "(also the automatic fallback on a single device)")
+                    help="transformers backend: micro-batches kept in flight "
+                         "across a 2+ GPU split; overlap needs GPU P2P "
+                         "(Kaggle T4s have none — use --backend vllm there); "
+                         "1 = sequential (the single-device fallback too)")
     lt.add_argument("--balanced-split", action="store_true",
-                    help="split the model by equal LAYER counts instead of "
-                         "device_map=auto's memory balance, evening out the "
-                         "per-GPU compute (qwen3 models on 2+ GPUs only; "
-                         "ignored otherwise)")
+                    help="transformers backend: split by equal LAYER counts "
+                         "instead of device_map=auto's memory balance "
+                         "(qwen3 models on 2+ GPUs only; ignored otherwise)")
     lt.add_argument("--input-type", default="passage", choices=["passage", "query"],
                     help="Use one consistent type for the whole corpus.")
     lt.add_argument("--instruction", default=None,

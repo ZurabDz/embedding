@@ -25,3 +25,6 @@ data/
 .ipynb_checkpoints/
 test.ipynb
 lm/lm_working.ipynb
+
+# bench results are run artifacts, not source
+bench/results*.json

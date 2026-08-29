@@ -82,9 +82,23 @@ def build_parser() -> argparse.ArgumentParser:
                     help="HF model id — part of the cache config key, so "
                          "changing it re-embeds everything; Qwen3-Embedding-"
                          "0.6B/4B fit one GPU (or CPU for smoke runs)")
-    lt.add_argument("--batch-size", type=int, default=16,
-                    help="sentences per forward pass; halved automatically on "
-                         "GPU OOM")
+    lt.add_argument("--batch-size", type=int, default=2048,
+                    help="sentences handed to the encoder per call; the "
+                         "encoder packs its own forward passes, so the "
+                         "OOM-adaptive knob is --micro-batch-tokens")
+    lt.add_argument("--micro-batch-tokens", type=int, default=16384,
+                    help="padded-token budget per forward pass; shrunk for "
+                         "good on GPU OOM (floor: a single sequence)")
+    lt.add_argument("--pipeline-threads", type=int, default=3,
+                    help="micro-batches kept in flight when the model is "
+                         "split across 2+ GPUs, so the pipeline stages "
+                         "overlap instead of taking turns; 1 = sequential "
+                         "(also the automatic fallback on a single device)")
+    lt.add_argument("--balanced-split", action="store_true",
+                    help="split the model by equal LAYER counts instead of "
+                         "device_map=auto's memory balance, evening out the "
+                         "per-GPU compute (qwen3 models on 2+ GPUs only; "
+                         "ignored otherwise)")
     lt.add_argument("--input-type", default="passage", choices=["passage", "query"],
                     help="Use one consistent type for the whole corpus.")
     lt.add_argument("--instruction", default=None,

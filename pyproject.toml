@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "ka-mlm",
     "geo-distill",
+    "kaggle>=2.2.4",
 ]
 
 [project.optional-dependencies]

@@ -183,10 +183,10 @@ def test_query_instruction_formatting(tmp_path, corpus):
 
 
 def test_oom_halves_batch_persistently(tmp_path, monkeypatch, corpus):
-    args = make_args(tmp_path)  # default --batch-size 16
+    args = make_args(tmp_path)  # default --batch-size 2048
     enc = run_with(monkeypatch, args, FakeEncoder(oom_above=4))
     assert np.load(args.out_emb).shape == (len(corpus), DIM)
-    assert max(len(b) for b in enc.batches) <= 4  # halved 16->8->4, never grew
+    assert max(len(b) for b in enc.batches) <= 4  # halved 2048->...->4, never grew
 
 
 def test_cli_wiring_defaults():
@@ -195,6 +195,9 @@ def test_cli_wiring_defaults():
     assert a.output_dim == 1024 and a.store_dtype == "float32"
     assert a.device_map == "auto" and a.checkpoint_every == 2048
     assert a.push_to == "ZurabDz/geo-teacher-qwen3-8b" and not a.no_push
+    # encoder-side batching: whole shards in, micro-batches inside
+    assert a.batch_size == 2048 and a.micro_batch_tokens == 16384
+    assert a.pipeline_threads == 3 and not a.balanced_split
     f = build_parser().parse_args(["fetch-teacher"])
     assert f.repo == "ZurabDz/geo-teacher-qwen3-8b"
     f = build_parser().parse_args(["fetch-teacher", "user/other"])

@@ -12,7 +12,9 @@ The two connect through Hugging Face Hub artifacts: `lm` pushes the encoder
 ([ZurabDz/ka-bpe-32k](https://hf.co/ZurabDz/ka-bpe-32k)); `geo_distill`
 consumes both via `--mlm-checkpoint` / `--tokenizer`. Teacher embeddings
 generated on Kaggle GPUs round-trip through a private dataset repo the same
-way (`local-teacher --push-to` / `fetch-teacher`).
+way (`local-teacher --push-to` / `fetch-teacher`), and the distilled student
+through a private *model* repo (`train --push-to` / `fetch-student`) — which
+is also what lets a capped session resume with `train --resume`.
 
 ## Install
 
@@ -41,5 +43,5 @@ packages only add floors on top of it):
   `python lm.py …` from inside `lm/` still works.
 - `python -m geo_distill <stage> …` or the `geo-distill` script — the
   distillation pipeline: `data | tokenizer | teacher | local-teacher |
-  fetch-teacher | synthetic-teacher | train | eval` (see
+  fetch-teacher | synthetic-teacher | train | fetch-student | eval` (see
   [`geo_distill/README.md`](geo_distill/README.md)).

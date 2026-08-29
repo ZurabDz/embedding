@@ -29,15 +29,20 @@ Qwen3-Embedding specifics
   (flash-attention needs Ampere+, Kaggle T4s are Turing).
 
 Dual-GPU throughput
-  The fp16 8B does not fit one T4, so device_map="auto" splits the layers
-  across both — a 2-stage pipeline where a naive forward keeps only one GPU
-  busy at a time. encode() therefore packs length-sorted micro-batches under a
-  token budget (--micro-batch-tokens, halved for good on OOM) and keeps
-  --pipeline-threads of them in flight, so GPU0 runs micro-batch i+1 while
-  GPU1 finishes i. Safe because a plain Qwen3 forward with use_cache=False
-  has no shared mutable state (per-forward RoPE, no KV cache, stateless
-  accelerate hooks) — but only a plain forward: .generate() has real
-  concurrency bugs and must never run through this model.
+  The fp16 8B does not fit one T4, so the transformers backend splits the
+  layers across both via device_map — a 2-stage pipeline. encode() packs
+  length-sorted micro-batches under a token budget (--micro-batch-tokens)
+  and keeps --pipeline-threads of them in flight; that overlap only
+  materializes on GPUs with P2P, though: on Kaggle's PCIe T4s (no P2P) every
+  cross-device tensor move serializes both GPUs, so they take turns and
+  throughput caps at one-GPU-equivalent no matter what. `--backend vllm` is
+  the real dual-GPU path there: tensor parallelism runs every layer on both
+  GPUs at once (NCCL handles the no-P2P hop properly), with vLLM's own
+  scheduler batching whole shards. The threaded transformers path stays safe
+  because a plain Qwen3 forward with use_cache=False has no shared mutable
+  state (per-forward RoPE, no KV cache, stateless non-offload hooks) — but
+  only a plain forward: .generate() has real concurrency bugs and must never
+  run through this model.
 """
 from __future__ import annotations
 
@@ -77,10 +82,16 @@ def corpus_sha1(sentences: list[str]) -> str:
 
 
 def config_key(model: str, input_type: str, output_dim, max_seq_len: int,
-               instruction: str, corpus_hash: str) -> str:
+               instruction: str, corpus_hash: str,
+               backend: str = "transformers") -> str:
     """Mirrors teacher.key() semantics: any setting that changes the vectors
-    changes the key (and thereby the cache subdirectory)."""
+    changes the key (and thereby the cache subdirectory). Backends differ by
+    fp16 kernel noise (~0.999 cosine), so they key separately — but the
+    transformers tag stays byte-identical to the pre-backend format, keeping
+    every existing cache and pushed artifact seedable."""
     tag = f"{model}|{input_type}|{output_dim or 'full'}|{max_seq_len}|{instruction}"
+    if backend != "transformers":
+        tag += f"|{backend}"
     return hashlib.sha1(f"{tag}\x00{corpus_hash}".encode("utf-8")).hexdigest()[:16]
 
 
@@ -304,14 +315,91 @@ def make_encoder(args):
     """Build encode(texts) -> (n, D) float32, rows L2-normalized.
 
     The single seam between the pipeline logic and the model — tests replace
-    this function, so ALL torch/transformers imports live here (keeping
-    `import geo_distill.local_teacher` as cheap as teacher.py's import).
+    this function, so ALL torch/transformers/vllm imports live below it
+    (keeping `import geo_distill.local_teacher` as cheap as teacher.py's).
+    """
+    if getattr(args, "backend", "transformers") == "vllm":
+        return _make_vllm_encoder(args)
+    return _make_transformers_encoder(args)
 
-    encode() owns its batching: one up-front tokenize of the whole chunk,
-    length-sorted micro-batches under --micro-batch-tokens, and (when the
-    model spans 2+ GPUs) --pipeline-threads of them in flight so the pipeline
-    stages overlap. use_cache=False throughout — embedding never decodes, and
-    the KV cache would cost ~144 KB/token on the 8B for nothing.
+
+def _make_vllm_encoder(args):
+    """encode() via vLLM tensor parallelism: BOTH GPUs run every layer at
+    once (NCCL copes with Kaggle's no-P2P PCIe, unlike the transformers
+    split, whose stage handoffs serialize the two T4s into taking turns).
+
+    vLLM is deliberately not a package extra — it pins its own torch — so it
+    is installed per Kaggle session. The encoder owns its batching: run()
+    hands it whole shards and vLLM's continuous-batching scheduler does the
+    rest, which is why the micro-batch/pipeline flags don't apply here.
+    """
+    # Both must be set before vllm is imported: Kaggle notebooks already have
+    # CUDA initialized (fork would break), and the T4s have no P2P (silence
+    # the probe's warning).
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    os.environ.setdefault("NCCL_IGNORE_DISABLED_P2P", "1")
+    try:
+        from vllm import LLM
+    except ImportError as exc:
+        raise SystemExit(
+            "--backend vllm needs vLLM (not an extra — it pins its own "
+            "torch): pip install vllm==0.28.0   "
+            "(sm75/T4 fallback pin: vllm==0.23.0)") from exc
+    import torch
+
+    tp = args.tensor_parallel or torch.cuda.device_count() or 1
+    kwargs = dict(model=args.model, tensor_parallel_size=tp,
+                  dtype="float16",          # T4s (sm_75) have no bfloat16
+                  max_model_len=args.max_seq_len,
+                  gpu_memory_utilization=args.gpu_memory_utilization,
+                  enforce_eager=True)       # skip CUDA-graph capture: saves
+    try:                                    # ~1 GiB + minutes on T4s
+        llm = LLM(runner="pooling", **kwargs)
+    except TypeError:  # pre-0.24 pins (the sm75 FlashInfer line) say task=
+        llm = LLM(task="embed", **kwargs)
+    try:
+        from vllm import PoolingParams
+
+        # Engine-side truncation for over-long inputs. NOTE: this keeps the
+        # LAST max_seq_len tokens where the HF path keeps the FIRST — moot
+        # for the <=300-char corpus, and the backends never share cache keys.
+        pooling = PoolingParams(truncate_prompt_tokens=-1)
+    except Exception:  # noqa: BLE001  (older PoolingParams without the field)
+        pooling = None
+    print(f"loaded {args.model} via vLLM (tensor_parallel={tp}, fp16, "
+          f"max_len {args.max_seq_len})")
+
+    def encode(texts):
+        try:
+            outs = llm.embed(list(texts), use_tqdm=False,
+                             pooling_params=pooling)
+        except TypeError:  # embed() without the pooling_params kwarg
+            outs = llm.embed(list(texts), use_tqdm=False)
+        emb = np.asarray([o.outputs.embedding for o in outs], dtype=np.float32)
+        # vLLM's default pooler for this model already does last-token + L2
+        # normalize (matching the HF reference); renormalizing is a no-op
+        # guard, and Matryoshka stays here — never PoolingParams(dimensions=),
+        # which vLLM rejects for repos that don't declare is_matryoshka.
+        emb /= np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12
+        if args.output_dim:
+            if args.output_dim > emb.shape[1]:
+                raise SystemExit(f"--output-dim {args.output_dim} exceeds the "
+                                 f"model's native dim {emb.shape[1]}")
+            emb = emb[:, :args.output_dim]
+            emb /= np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12
+        return emb
+
+    encode.owns_batching = True  # run() hands over whole shards
+    return encode
+
+
+def _make_transformers_encoder(args):
+    """encode() via transformers: the fp16 8B splits across GPUs (device_map)
+    as a 2-stage pipeline. One up-front tokenize per chunk, length-sorted
+    micro-batches under --micro-batch-tokens, --pipeline-threads in flight
+    (overlap needs GPU P2P — on Kaggle T4s the stages take turns regardless;
+    use --backend vllm there). use_cache=False throughout — embedding never
+    decodes, and the KV cache would cost ~144 KB/token on the 8B for nothing.
     """
     import torch
     import torch.nn.functional as F
@@ -452,7 +540,7 @@ def finalize_shards(sentences, store: ShardStore, args, instruction: str) -> dic
         "config_key": store.key,
         "store_dtype": args.store_dtype,
         "max_seq_len": args.max_seq_len,
-        "backend": "transformers",
+        "backend": getattr(args, "backend", "transformers"),
         "device_map": args.device_map,
         "instruction": instruction,
     }
@@ -509,14 +597,16 @@ def run(args) -> None:
 
     instruction = resolve_instruction(args)
     chash = corpus_sha1(sentences)
+    backend = getattr(args, "backend", "transformers")
     key = config_key(args.model, args.input_type, args.output_dim,
-                     args.max_seq_len, instruction, chash)
+                     args.max_seq_len, instruction, chash, backend)
     store = ShardStore(args.cache_dir, key, len(sentences), args.checkpoint_every,
                        manifest_extra={"model": args.model,
                                        "input_type": args.input_type,
                                        "output_dim": args.output_dim,
                                        "max_seq_len": args.max_seq_len,
                                        "instruction": instruction,
+                                       "backend": backend,
                                        "corpus_sha1": chash})
 
     seeded = seed_store_from_outputs(store, sentences, args)
@@ -533,7 +623,10 @@ def run(args) -> None:
     stop_reason = None
     if missing:
         encode = make_encoder(args)
-        bs = args.batch_size
+        # An encoder that owns its batching (vLLM) gets each shard whole and
+        # schedules its own micro-batches.
+        bs = (len(sentences) if getattr(encode, "owns_batching", False)
+              else args.batch_size)
         done = 0
         t0 = time.monotonic()
         try:

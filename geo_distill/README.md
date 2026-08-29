@@ -251,6 +251,12 @@ What is in a checkpoint, and why:
   wants the second. Restoring only parameters would re-warm the learning rate
   from zero and replay epoch 0's dropout masks; with all of it, a resumed run
   reproduces the uninterrupted one exactly.
+- `--log-every N` (default 50) prints a progress line inside the epoch — the
+  mean loss since the previous line, the learning rate, steps/s and an ETA for
+  the remaining training steps (validation and pushes are not in that clock, so
+  it reads slightly optimistic). On the full corpus an epoch is thousands of
+  steps and the per-epoch summary is a long time coming; `0` prints only that
+  summary. The in-epoch lines are indented, so the epoch lines still stand out.
 - `--save-every N` (default 1) sets the local checkpoint cadence; `--push-every
   N` (default 0 = final only) the Hub one, and must be a multiple of it. Each
   push blocks training while it uploads and carries the optimizer moments

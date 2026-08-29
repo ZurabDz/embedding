@@ -223,6 +223,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "loss (0 = pure regression, the default)")
     tr.add_argument("--sim-loss", default="kl", choices=["mse", "kl"])
     tr.add_argument("--temperature", type=float, default=0.05)
+    tr.add_argument("--log-every", type=int, default=50,
+                    help="print an in-epoch progress line every N steps: the "
+                         "mean loss since the previous line, the learning rate, "
+                         "steps/s and an ETA for the remaining training steps. "
+                         "0 prints only the per-epoch summary. On the full "
+                         "corpus one epoch is thousands of steps, so this is "
+                         "the only sign of life in between")
     tr.add_argument("--save-every", type=int, default=1,
                     help="write the resume checkpoint (latest params + Adam "
                          "moments + shuffle position) every N epochs; 0 writes "

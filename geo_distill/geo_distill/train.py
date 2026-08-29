@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 
 import numpy as np
 import jax.numpy as jnp
@@ -63,6 +64,12 @@ def _sha256_file(path: str) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _hms(seconds: float) -> str:
+    """h:mm:ss — an ETA is read at a glance, not parsed."""
+    s = max(0, int(seconds))
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
 
 
 def _fingerprint(args, *, lr: float, vocab_size: int, n_sentences: int,
@@ -412,17 +419,57 @@ def run(args) -> None:
     # ---- train ------------------------------------------------------------ #
     print(f"training epochs {start_epoch + 1}..{args.epochs} at "
           f"{steps_per_epoch} steps/epoch ({total_steps} total)")
+    if args.log_every:
+        # On the real corpus an epoch is thousands of steps, so without this
+        # the run looks hung between the (minutes or hours apart) epoch lines.
+        print("compiling the train step — the first step takes a moment ...",
+              flush=True)
     pushed = None
+    # The in-epoch log reports the window since the previous line, not the run
+    # so far: a rate averaged from step 1 would still be carrying the compile,
+    # and a loss averaged from step 1 stops moving once the epoch is old.
+    seen = start_epoch * steps_per_epoch     # global steps, resume included
     for epoch in range(start_epoch, args.epochs):
         order = rng.permutation(len(train_idx))
         running = 0.0
+        # Opened per epoch, so the validation pass and any Hub push between two
+        # epochs never land inside a window's clock.
+        win_t0, win_seen, win_loss = time.time(), seen, 0.0
         for s in range(steps_per_epoch):
             bidx = order[s * args.batch_size : (s + 1) * args.batch_size]
-            loss = train_step(
+            # float() is a device sync; the epoch average needs it every step
+            # anyway, so the log line costs nothing extra.
+            loss = float(train_step(
                 model, optimizer,
                 jnp.asarray(tr_tokens[bidx]), jnp.asarray(tr_mask[bidx]),
-                jnp.asarray(tr_teacher[bidx]), jnp.asarray(tr_target[bidx]))
-            running += float(loss)
+                jnp.asarray(tr_teacher[bidx]), jnp.asarray(tr_target[bidx])))
+            running += loss
+            win_loss += loss
+            seen += 1
+            if not args.log_every:
+                continue
+            if epoch == start_epoch and s == 0:
+                # jit compiled the whole graph inside this one step. Report it
+                # and restart the clock: folded into the average it would
+                # understate the rate for the rest of the session and skew
+                # every ETA with it.
+                print(f"  first step took {time.time() - win_t0:.0f}s "
+                      f"(jit compile included)", flush=True)
+                win_t0, win_seen, win_loss = time.time(), seen, 0.0
+            elif (s + 1) % args.log_every == 0:
+                now = time.time()
+                n = seen - win_seen
+                rate = n / max(now - win_t0, 1e-6)
+                # Training steps only: the per-epoch validation, checkpoint and
+                # push are not in the rate, so this reads a little optimistic.
+                left = (args.epochs - epoch - 1) * steps_per_epoch + \
+                    steps_per_epoch - (s + 1)
+                print(f"  epoch {epoch:3d} step {s + 1:>6}/{steps_per_epoch} "
+                      f"| loss {win_loss / n:.5f} "
+                      f"| lr {float(schedule(seen - 1)):.2e} "
+                      f"| {rate:.2f} it/s | eta {_hms(left / max(rate, 1e-9))}",
+                      flush=True)
+                win_t0, win_seen, win_loss = now, seen, 0.0
 
         # evaluate on the held-out set (dropout off, then back on for training)
         model.eval()

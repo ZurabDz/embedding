@@ -47,6 +47,8 @@ teacher            → artifacts/teacher_emb.npy (teacher vectors, cached)
   [alternatives: local-teacher (GPU, no rate limits) · synthetic-teacher (offline)]
 fetch-teacher      ← pulls the same artifacts back from a HF dataset repo
 train              → <out-dir>/student_*.{json,msgpack} + teacher_mean.npy
+                     + train_state.json   (resumable; --push-to syncs to a HF model repo)
+fetch-student      ← pulls the trained student back from that model repo
 eval               → correlation + retrieval demo
 ```
 
@@ -186,8 +188,12 @@ The training session (any machine) then starts with:
 
 ```bash
 python -m geo_distill fetch-teacher    # → artifacts/teacher_emb.npy + sentences.json
-python -m geo_distill train --mlm-checkpoint ZurabDz/ka-mlm --tokenizer ZurabDz/ka-bpe-32k ...
+python -m geo_distill train --mlm-checkpoint ZurabDz/ka-mlm --tokenizer ZurabDz/ka-bpe-32k \
+    --push-to <user>/ka-embed --push-every 2 [--resume]
 ```
+
+That training session is itself capped, so it checkpoints and resumes the same
+way — see [4c](#4c-chaining-a-distillation-across-capped-sessions) below.
 
 **4. Distill** (from scratch):
 ```bash
@@ -211,6 +217,61 @@ every row. Private repos need `HF_TOKEN` (the Colab secrets vault and
 `teacher` are unchanged. The from-scratch sizing flags (`--dim/--depth/...`)
 are ignored and the default LR drops to 5e-5 (fine-tuning). `eval` works on
 either kind unchanged.
+
+**4c. Chaining a distillation across capped sessions.** Ten epochs over a
+million sentences outlive a free Kaggle session, so `train` checkpoints and
+resumes the way `lm` does. `--push-to` names a private HF **model** repo (the
+student's twin of the teacher's dataset repo — separate Hub namespaces), and
+write access is verified up front, before the corpus load and the encoder
+download:
+
+```bash
+# session 1 — checkpoint locally every epoch, mirror to the Hub every 2
+python -m geo_distill train --mlm-checkpoint ZurabDz/ka-mlm --tokenizer ZurabDz/ka-bpe-32k \
+    --epochs 10 --batch-size 128 --dropout 0.1 \
+    --push-to <user>/ka-embed --push-every 2
+
+# session 2 — the identical command plus --resume; the repo's checkpoint is
+# pulled first when it is newer than anything local
+python -m geo_distill train --mlm-checkpoint ZurabDz/ka-mlm --tokenizer ZurabDz/ka-bpe-32k \
+    --epochs 10 --batch-size 128 --dropout 0.1 \
+    --push-to <user>/ka-embed --push-every 2 --resume
+
+# anywhere, later — download the finished student and score it
+python -m geo_distill fetch-student <user>/ka-embed
+python -m geo_distill eval --model-dir artifacts --query "საქართველოს ისტორია"
+```
+
+What is in a checkpoint, and why:
+
+- `student_params.msgpack` is the **best** epoch by held-out Spearman;
+  `student_state.msgpack` is the **latest** parameters plus the Adam moments,
+  the dropout rng counters and the shuffle position. They diverge the moment an
+  epoch fails to improve — `eval` always wants the first, a continuation always
+  wants the second. Restoring only parameters would re-warm the learning rate
+  from zero and replay epoch 0's dropout masks; with all of it, a resumed run
+  reproduces the uninterrupted one exactly.
+- `--save-every N` (default 1) sets the local checkpoint cadence; `--push-every
+  N` (default 0 = final only) the Hub one, and must be a multiple of it. Each
+  push blocks training while it uploads and carries the optimizer moments
+  (~2× the parameters), which is the price of being resumable *from the Hub*
+  rather than only from the local directory.
+- A resume must be the **same run**: everything that defines the training math
+  — architecture, tokenizer, objective weights, seed, batch size, dropout, and
+  the corpus itself — is fingerprinted, and a mismatch names the field that
+  moved instead of silently training something else. `--epochs` is the one
+  exception: raising it extends the run and re-stretches the cosine decay,
+  which is announced rather than hidden.
+- Growing the teacher corpus between sessions is a **hard error**, not a
+  warning: a longer corpus rescales the schedule, redefines an epoch, and moves
+  the mean the regression targets are centered on, so the saved parameters
+  would be chasing a target space that shifted under them. Start a fresh run on
+  the bigger corpus.
+- Neither side clobbers the other by accident. A fresh run (no `--resume`)
+  refuses to push over a repo that already holds a run — unlike the local
+  directory, the repo's copy is the only one. And a `--resume` whose `--push-to`
+  names a *different* run refuses before pulling, because promoting the repo's
+  files would overwrite the local run's best parameters.
 
 **5. Evaluate + try retrieval**:
 ```bash
@@ -237,7 +298,9 @@ python -m geo_distill eval --query "ქართული ღვინო და
 
 - **Pearson / Spearman** of the pairwise similarities — does the student place
   sentences in the same relative geometry? Spearman (rank correlation) is the
-  one to watch; `train` keeps the checkpoint with the best val Spearman.
+  one to watch; `train` keeps the parameters of the best-Spearman epoch in
+  `student_params.msgpack` (the resume checkpoint beside it holds the latest
+  ones, which is a different thing — see 4c).
 - **top-1 NN agreement** — for each sentence, is the student's nearest
   neighbour the same as the teacher's? The most retrieval-relevant number.
 
@@ -268,12 +331,12 @@ python -m geo_distill eval --query "ქართული ღვინო და
 | `tokenizer.py` | train a BPE (shared `mlm` recipe) or Unigram, five specials at 0–4 |
 | `teacher.py` | Gemini teacher client (cached, rate-limited) + the synthetic stand-in |
 | `local_teacher.py` | local open-weights teacher (Qwen3-Embedding): fp16 shard cache, multi-GPU inference, OOM backoff |
-| `hub.py` | push/pull the teacher artifacts through a private HF *dataset* repo |
+| `hub.py` | push/pull the teacher artifacts (private HF *dataset* repo) and the student (private HF *model* repo) |
 | `model.py` | tiny from-scratch encoder → mean-pool → projection → L2-norm |
 | `mlm_student.py` | student wrapping the pretrained MLM encoder (head stripped) |
 | `students.py` | the scratch/mlm registry + the typed `StudentConfig` |
 | `losses.py` | cosine regression + the two similarity-matching losses |
 | `metrics.py` | Pearson/Spearman similarity agreement, NN@1 |
-| `checkpoint.py` | atomic writes; student config/params save + load |
-| `train.py` | the distillation training loop |
+| `checkpoint.py` | atomic writes; student config/params save + load; the resume checkpoint (latest params + Adam moments + rng) |
+| `train.py` | the distillation training loop: checkpointing, `--resume`, and the Hub push cadence |
 | `eval.py` | correlation with teacher + nearest-neighbour retrieval demo |

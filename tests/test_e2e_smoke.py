@@ -35,6 +35,35 @@ def test_scratch_pipeline(tmp_path):
     assert "Spearman" in r.stdout and "Query:" in r.stdout
 
 
+def test_resume_pipeline(tmp_path):
+    """The real CLI wiring for a chained session: train, die, resume, eval."""
+    cli(tmp_path, "tokenizer", "--input", str(SAMPLES),
+        "--vocab-size", "800", "--min-frequency", "1")
+    cli(tmp_path, "synthetic-teacher", "--input", str(SAMPLES))
+    tail = ["--batch-size", "16", "--warmup", "5", "--out-dir", "student"]
+    common = ["train", "--epochs", "4", *tail]
+
+    # a session that only got through 2 of the 4 epochs
+    cli(tmp_path, "train", "--epochs", "2", *tail)
+    state = json.loads((tmp_path / "student" / "train_state.json").read_text())
+    assert state["epoch"] == 2 and state["epochs"] == 2
+
+    r = cli(tmp_path, *common, "--resume")
+    assert "resumed at epoch 2/4" in r.stdout
+    assert "re-stretched" in r.stdout          # --epochs was raised from 2
+    assert [l[:9] for l in r.stdout.splitlines()
+            if l.startswith("epoch ")] == ["epoch   2", "epoch   3"]
+    assert json.loads(
+        (tmp_path / "student" / "train_state.json").read_text())["epoch"] == 4
+
+    r = cli(tmp_path, "eval", "--model-dir", "student")
+    assert "Spearman" in r.stdout
+
+    # resuming a finished run at the same --epochs has nothing left to do
+    r = cli(tmp_path, *common, "--resume", check=False)
+    assert r.returncode != 0 and "raise it to continue" in r.stderr
+
+
 def test_mlm_pipeline_and_mispair_guard(tmp_path, tiny_checkpoint):
     ck_dir, _ = tiny_checkpoint
     # the checkpoint's tokenizer twin: same recipe, same corpus, same vocab

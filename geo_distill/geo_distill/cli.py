@@ -154,6 +154,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="dataset repo id (default: %(default)s)")
     ft.add_argument("--out-dir", default=paths.ARTIFACTS_DIR)
 
+    fs = sub.add_parser("fetch-student",
+                        help="download a trained student from a HF model repo "
+                             "(pushed by train --push-to) into artifacts/, "
+                             "ready for eval")
+    fs.add_argument("repo", nargs="?", default=paths.DEFAULT_STUDENT_MODEL_REPO,
+                    help="model repo id (default: %(default)s)")
+    fs.add_argument("--out-dir", default=paths.ARTIFACTS_DIR)
+
     st = sub.add_parser("synthetic-teacher",
                         help="offline stand-in for the teacher: fabricates a "
                              "structured signal, no API key needed")
@@ -173,7 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="tokenizers-JSON path, or a Hub repo id (with "
                          "--mlm-checkpoint you want the tokenizer the encoder "
                          "was pretrained with, e.g. ZurabDz/ka-bpe-32k)")
-    tr.add_argument("--out-dir", default=paths.ARTIFACTS_DIR)
+    tr.add_argument("--out-dir", default=paths.ARTIFACTS_DIR,
+                    help="where the student lands: student_config.json + "
+                         "student_params.msgpack (best epoch) + "
+                         "teacher_mean.npy, plus student_state.msgpack + "
+                         "train_state.json for --resume")
     tr.add_argument("--mlm-checkpoint", default="",
                     help="initialise the student from a pretrained MLM encoder: "
                          "a Hub repo pushed by lm's --hub-checkpoints (e.g. "
@@ -211,12 +223,40 @@ def build_parser() -> argparse.ArgumentParser:
                          "loss (0 = pure regression, the default)")
     tr.add_argument("--sim-loss", default="kl", choices=["mse", "kl"])
     tr.add_argument("--temperature", type=float, default=0.05)
+    tr.add_argument("--save-every", type=int, default=1,
+                    help="write the resume checkpoint (latest params + Adam "
+                         "moments + shuffle position) every N epochs; 0 writes "
+                         "it only at the end. The best-epoch parameters are "
+                         "saved every time they improve, regardless")
+    tr.add_argument("--resume", action="store_true",
+                    help="continue the run in --out-dir, Adam moments and the "
+                         "LR schedule's position included; with --push-to, the "
+                         "repo's checkpoint is pulled first when it is newer "
+                         "than anything local. Everything that defines the "
+                         "training math must match the original command — "
+                         "except --epochs, which may be raised")
+    tr.add_argument("--push-to", default="",
+                    help="HF *model* repo id (user/repo) to sync the student "
+                         "with, e.g. " + paths.DEFAULT_STUDENT_MODEL_REPO +
+                         ": every push atomically replaces the repo's previous "
+                         "snapshot (created private; needs a write token), and "
+                         "--resume pulls it back — the same command then chains "
+                         "across capped Kaggle/Colab sessions. `fetch-student` "
+                         "downloads it anywhere later")
+    tr.add_argument("--push-every", type=int, default=0,
+                    help="push to --push-to every N epochs (a multiple of "
+                         "--save-every); 0 pushes only the final student. Each "
+                         "push blocks training while it uploads, and the "
+                         "snapshot includes the optimizer moments (~2x the "
+                         "parameters) so the run stays resumable from the Hub")
 
     ev = sub.add_parser("eval", help="score the student against the teacher and "
                                      "demo retrieval")
     ev.add_argument("--model-dir", default=paths.ARTIFACTS_DIR,
                     help="directory holding student_config.json + "
-                         "student_params.msgpack (train's --out-dir)")
+                         "student_params.msgpack (train's --out-dir, or where "
+                         "fetch-student landed); any resume state there is "
+                         "ignored — eval always scores the best epoch")
     ev.add_argument("--sentences", default=paths.SENTENCES_JSON)
     ev.add_argument("--teacher-emb", default=paths.TEACHER_EMB)
     ev.add_argument("--val-frac", type=float, default=0.1)
@@ -242,6 +282,29 @@ def main(argv=None) -> None:
     if args.cmd == "train" and args.reg_weight <= 0 and args.sim_weight <= 0:
         p.error("all loss weights are zero: raise --reg-weight or --sim-weight")
 
+    if args.cmd == "train" and (args.push_to or args.push_every):
+        # Fail before the corpus load and the encoder download, not an epoch in.
+        from geo_distill.hub import ensure_student_repo, hf_token
+
+        if not args.push_to:
+            p.error("--push-every needs --push-to: it sets the cadence of the "
+                    "pushes, it does not enable them")
+        if args.push_every and not args.save_every:
+            p.error("--push-every needs --save-every: with --save-every 0 the "
+                    "resume checkpoint is only written at the end, so there is "
+                    "nothing for a mid-run push to upload")
+        if args.push_every and args.push_every % args.save_every:
+            p.error(f"--push-every {args.push_every} needs --save-every to be a "
+                    f"divisor of it (got {args.save_every}), or pushes never "
+                    f"line up with a written checkpoint")
+        if hf_token() is None:
+            p.error("--push-to needs a Hugging Face write token: set HF_TOKEN, "
+                    "or run `hf auth login`")
+        try:
+            ensure_student_repo(args.push_to)
+        except RuntimeError as e:
+            p.error(str(e))
+
     if args.cmd == "data":
         from geo_distill.data import run
     elif args.cmd == "tokenizer":
@@ -252,6 +315,8 @@ def main(argv=None) -> None:
         from geo_distill.local_teacher import run
     elif args.cmd == "fetch-teacher":
         from geo_distill.hub import run_fetch as run
+    elif args.cmd == "fetch-student":
+        from geo_distill.hub import run_fetch_student as run
     elif args.cmd == "synthetic-teacher":
         from geo_distill.teacher import run_synthetic as run
     elif args.cmd == "train":

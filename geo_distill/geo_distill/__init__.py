@@ -9,7 +9,9 @@ installed `geo-distill` script):
     local-teacher      embed with a local open-weights teacher (Qwen3-Embedding, GPU)
     fetch-teacher      pull teacher artifacts back from a HF dataset repo
     synthetic-teacher  offline stand-in for the teacher (no API key, no credits)
-    train              distill the teacher's geometry into a student
+    train              distill the teacher's geometry into a student (resumable,
+                       syncs to a HF model repo)
+    fetch-student      pull a trained student back from that model repo
     eval               score the student against the teacher + retrieval demo
 
 Two students share the training loop: a tiny from-scratch EmbeddingModel, or

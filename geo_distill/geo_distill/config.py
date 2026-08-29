@@ -19,8 +19,14 @@ MLM_CKPT_CACHE = "artifacts/mlm_checkpoint"    # per-repo Hub checkpoint cache
 
 # Filenames inside a student --out-dir.
 STUDENT_CONFIG = "student_config.json"
-STUDENT_PARAMS = "student_params.msgpack"
+STUDENT_PARAMS = "student_params.msgpack"   # the BEST epoch's parameters
 TEACHER_MEAN = "teacher_mean.npy"
+# Resume state, rewritten every --save-every epochs (and always at the end).
+# Kept apart from STUDENT_PARAMS because they diverge the moment an epoch fails
+# to improve: eval always wants the best parameters, a continuation always wants
+# the latest ones.
+STUDENT_STATE = "student_state.msgpack"     # latest params + Adam moments + rng counters
+TRAIN_STATE = "train_state.json"            # epoch, best score, shuffle position, fingerprint
 
 # The teacher model is part of the embedding cache key (teacher_cache.jsonl):
 # changing it invalidates every cached vector, so it is a flag with this
@@ -39,3 +45,9 @@ DEFAULT_LOCAL_TEACHER_MODEL = "Qwen/Qwen3-Embedding-8B"
 # Where `local-teacher --push-to` lands and `fetch-teacher` pulls from by
 # default: a private HF *dataset* repo holding the three teacher artifacts.
 DEFAULT_TEACHER_DATASET_REPO = "ZurabDz/geo-teacher-qwen3-8b"
+
+# The student's twin of the above, and a *model* repo rather than a dataset one
+# (the two are separate Hub namespaces). `fetch-student` defaults to it;
+# `train --push-to` does NOT — pushing needs a write token and replaces whatever
+# the repo holds, so it stays opt-in.
+DEFAULT_STUDENT_MODEL_REPO = "ZurabDz/ka-embed"

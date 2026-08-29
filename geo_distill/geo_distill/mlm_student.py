@@ -93,11 +93,26 @@ def load_mlm_student(spec: str, out_dim: int, *, dropout: float = 0.0,
     return MlmStudent(encoder, out_dim, rngs=nnx.Rngs(seed)), cfg, step
 
 
-def build_mlm_student_from_config(mlm_encoder: dict, out_dim: int) -> MlmStudent:
+def build_mlm_student_from_config(mlm_encoder: dict, out_dim: int, *,
+                                  dropout: float | None = None,
+                                  seed: int = 0) -> MlmStudent:
     """Rebuild the architecture from student_config.json's mlm_encoder dict
-    (eval path — no Hub access); the fine-tuned weights come from
-    student_params.msgpack afterwards."""
+    (the eval and --resume paths — no Hub access); the fine-tuned weights come
+    from student_params.msgpack afterwards.
+
+    `dropout` overrides the saved rate (None keeps it); a resume passes the
+    rate it is continuing with. Returned in eval mode — MlmStudent's
+    `deterministic` argument is inert, the encoder's dropout follows
+    train()/eval() only, so a resuming trainer must call .train() itself.
+
+    The encoder keeps rngs=Rngs(0) whatever `seed` says: that is what
+    mlm.checkpoint.load_checkpoint hardcodes on the fresh path, and matching it
+    is what lets a resumed run restore the encoder's dropout counters onto the
+    same keys they were drawn from.
+    """
+    if dropout is not None:
+        mlm_encoder = {**mlm_encoder, "dropout": dropout}
     enc = MlmEncoder(EncoderConfig.from_json_dict(mlm_encoder), rngs=nnx.Rngs(0))
-    model = MlmStudent(enc, out_dim, rngs=nnx.Rngs(0))
+    model = MlmStudent(enc, out_dim, rngs=nnx.Rngs(seed))
     model.eval()
     return model

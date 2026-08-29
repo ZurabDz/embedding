@@ -16,11 +16,12 @@ from geo_distill.data import encode_batch
 
 @dataclasses.dataclass
 class StudentConfig:
-    """Everything eval.py needs to rebuild the student and reproduce its space.
+    """Everything eval.py — and a --resume — needs to rebuild the student and
+    reproduce its space, without going back to the Hub for the encoder.
 
     Written next to the params. Loading tolerates unknown keys and fills in
-    student_type for configs written before it existed, so old artifacts keep
-    evaluating.
+    defaults for fields written before they existed (student_type, dropout), so
+    old artifacts keep evaluating.
     """
 
     student_type: str
@@ -32,6 +33,13 @@ class StudentConfig:
     # mean itself is saved alongside as teacher_mean.npy, so the space the
     # student was trained into stays reproducible after the run exits.
     center: bool = True
+    # The dropout the run trained with. A *training* knob in an otherwise
+    # eval-oriented struct, because dropout is baked in at construction (the
+    # nnx.Dropout rate, and MultiHeadAttention's dropout_rate — which at rate 0
+    # forks no rng stream at all): a module rebuilt at 0.0 cannot be trained
+    # with dropout, so --resume has to know what to rebuild with. Inference
+    # ignores it; rebuild() defaults to 0.0.
+    dropout: float = 0.0
     # from-scratch architecture (None for mlm students)
     dim: int | None = None
     depth: int | None = None
@@ -75,16 +83,18 @@ class ScratchSpec:
         return encode_batch(tok, sentences, max_len)
 
     @staticmethod
-    def rebuild(cfg: StudentConfig):
+    def rebuild(cfg: StudentConfig, *, dropout: float = 0.0, seed: int = 0):
         from flax import nnx
 
         from geo_distill.model import EmbeddingModel
 
-        return EmbeddingModel(
+        model = EmbeddingModel(
             vocab_size=cfg.vocab_size, dim=cfg.dim, depth=cfg.depth,
             heads=cfg.heads, mlp_dim=cfg.mlp_dim, out_dim=cfg.out_dim,
-            max_len=cfg.max_len, dropout=0.0, embed_dim=cfg.embed_dim,
-            rngs=nnx.Rngs(0))
+            max_len=cfg.max_len, dropout=dropout, embed_dim=cfg.embed_dim,
+            rngs=nnx.Rngs(seed))
+        model.eval()  # parity with MlmSpec; train.py flips the mode it wants
+        return model
 
 
 class MlmSpec:
@@ -106,10 +116,11 @@ class MlmSpec:
         return encode_sentences(tok, sentences, max_len)
 
     @staticmethod
-    def rebuild(cfg: StudentConfig):
+    def rebuild(cfg: StudentConfig, *, dropout: float = 0.0, seed: int = 0):
         from geo_distill.mlm_student import build_mlm_student_from_config
 
-        return build_mlm_student_from_config(cfg.mlm_encoder, cfg.out_dim)
+        return build_mlm_student_from_config(cfg.mlm_encoder, cfg.out_dim,
+                                             dropout=dropout, seed=seed)
 
 
 SPECS = {"scratch": ScratchSpec, "mlm": MlmSpec}
